@@ -52,7 +52,8 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         console.print("\n  [yellow]⚠  LDAP Enumeration module not yet implemented.[/yellow]\n")
 
     elif key == "smb_enum":
-        console.print("\n  [yellow]⚠  SMB Enumeration module not yet implemented.[/yellow]\n")
+        from modules.smb_enum_module import run as smb_run
+        smb_run(state)
 
     elif key == "smbrelay":
         console.print("\n  [yellow]⚠  SMB Relay module not yet implemented.[/yellow]\n")
