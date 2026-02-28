@@ -235,6 +235,7 @@ class NmapScanner:
             "-sV",      # service/version detection
             "-p-",      # all 65535 ports
             "--open",   # show only open ports
+            "-T5",      # insane timing — fastest scan speed
             target,
         ]
 
