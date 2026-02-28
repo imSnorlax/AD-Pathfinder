@@ -659,14 +659,29 @@ def assessment_menu(state: AssessmentState) -> None:
         print_assessment_header(state)
         console.print()
 
-        console.print("[bold bright_cyan]Assessment Menu[/bold bright_cyan]\n")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan (nmap)")
-        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration")
-        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute Force")
-        console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Kerberoasting")
-        console.print("  [bright_cyan]6.[/bright_cyan]  Password Spraying")
-        console.print("  [bright_cyan]7.[/bright_cyan]  Execute Suggested Action")
+        console.rule("[bold bright_cyan]Assessment Menu[/bold bright_cyan]")
+        console.print()
+
+        # ── Smart guide (promoted — most useful entry point) ──────────────
+        console.print("  [bold bright_cyan]★[/bold bright_cyan]  [bold bright_cyan]7.[/bold bright_cyan]  [bold white]Auto-Suggest Next Step[/bold white]  [dim](recommended — engine picks the best action based on current findings)[/dim]")
+        console.print()
+
+        # ── RECON ─────────────────────────────────────────────────────────
+        console.print("  [dim]── RECON ──────────────────────────────────────────────────[/dim]")
+        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan          [dim](nmap — always run this first)[/dim]")
+        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration             [dim](users, groups, SPNs, AS-REP targets)[/dim]")
+        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute  [dim](shares, signing, user discovery)[/dim]")
+        console.print()
+
+        # ── ATTACKS ───────────────────────────────────────────────────────
+        console.print("  [dim]── ATTACKS ────────────────────────────────────────────────[/dim]")
+        console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting              [dim](port 88 required — no creds needed)[/dim]")
+        console.print("  [bright_cyan]5.[/bright_cyan]  Kerberoasting                [dim](port 88 + valid creds required)[/dim]")
+        console.print("  [bright_cyan]6.[/bright_cyan]  Password Spraying            [dim](users required — lockout detection on)[/dim]")
+        console.print()
+
+        # ── SESSION ───────────────────────────────────────────────────────
+        console.print("  [dim]── SESSION ────────────────────────────────────────────────[/dim]")
         console.print("  [bright_cyan]8.[/bright_cyan]  View Findings Log")
         console.print("  [bright_cyan]9.[/bright_cyan]  Save & Return to Main Menu")
         console.print()
