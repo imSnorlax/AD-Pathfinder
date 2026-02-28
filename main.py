@@ -195,7 +195,7 @@ def assessment_menu(state: AssessmentState) -> None:
         console.print()
 
         console.print("[bold bright_cyan]Assessment Menu[/bold bright_cyan]\n")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan         [dim](coming soon)[/dim]")
+        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan")
         console.print("  [bright_cyan]2.[/bright_cyan]  User Enumeration             [dim](coming soon)[/dim]")
         console.print("  [bright_cyan]3.[/bright_cyan]  Kerberoasting                [dim](coming soon)[/dim]")
         console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting              [dim](coming soon)[/dim]")
@@ -210,7 +210,12 @@ def assessment_menu(state: AssessmentState) -> None:
             show_choices=False,
         )
 
-        if choice in ("1", "2", "3", "4", "5"):
+        if choice == "1":
+            from modules.nmap_module import run as nmap_run
+            nmap_run(state)
+            save_session(state)
+
+        elif choice in ("2", "3", "4", "5"):
             console.print("\n  [yellow]⚠  This module is not yet implemented.[/yellow]")
             console.print("  [dim]Stub hook is ready — drop a module in and wire it here.[/dim]\n")
 
