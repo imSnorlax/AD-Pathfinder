@@ -49,7 +49,9 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         console.print("\n  [yellow]⚠  AS-REP Roasting module not yet implemented.[/yellow]\n")
 
     elif key == "ldap_enum":
-        console.print("\n  [yellow]⚠  LDAP Enumeration module not yet implemented.[/yellow]\n")
+        from modules.ldap_enum_module import run as ldap_run
+        result = ldap_run(state)
+        _display_ldap_results(result)
 
     elif key == "smb_enum":
         from modules.smb_enum_module import run as smb_run
@@ -192,6 +194,98 @@ def _display_suggestions(suggestions: list[dict]) -> None:
         )
 
     console.print(table)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# LDAP results display
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _display_ldap_results(result: dict) -> None:
+    """
+    Render the structured result dict from ldap_enum_module using rich.
+    Called immediately after the module returns, before session is saved.
+    """
+    if result["status"] == "error":
+        console.print(
+            f"\n  [bold red]✘  LDAP Enumeration failed:[/bold red] {result['error']}\n"
+        )
+        for w in result.get("warnings", []):
+            console.print(f"  [yellow]⚠  {w}[/yellow]")
+        return
+
+    # ── Summary table ───────────────────────────────────────────
+    table = Table(
+        title="[bold bright_cyan]LDAP Enumeration Results[/bold bright_cyan]",
+        box=box.ROUNDED,
+        border_style="bright_blue",
+        show_lines=True,
+        expand=False,
+    )
+    table.add_column("Property",  style="bold bright_cyan", width=24)
+    table.add_column("Value",     style="white")
+
+    anon = result["anonymous"]
+    table.add_row(
+        "Anonymous Bind",
+        "[bold red]ALLOWED[/bold red]" if anon else "[green]Denied[/green]",
+    )
+    table.add_row("LDAPS", "[green]Yes[/green]" if result["ldaps"] else "[dim]No[/dim]")
+    table.add_row("Users Discovered",  str(len(result["users"])))
+    table.add_row("Groups Discovered", str(len(result["groups"])))
+    table.add_row("SPNs Found",        str(len(result["spns"])))
+
+    asrep = result["asrep_users"]
+    asrep_display = (
+        f"[bold red]{len(asrep)} ROASTABLE[/bold red]: " + ", ".join(asrep[:6])
+        + (" …" if len(asrep) > 6 else "")
+        if asrep else "[green]None detected[/green]"
+    )
+    table.add_row("AS-REP Roastable", asrep_display)
+
+    desc = result["desc_findings"]
+    desc_display = (
+        f"[bold red]{len(desc)} suspicious[/bold red]"
+        if desc else "[green]None detected[/green]"
+    )
+    table.add_row("Description Creds", desc_display)
+
+    console.print()
+    console.print(table)
+
+    # ── Suspicious descriptions detail ────────────────────────────
+    if desc:
+        desc_table = Table(
+            title="[bold red]⚠  Suspicious Description Fields[/bold red]",
+            box=box.SIMPLE,
+            border_style="red",
+            show_lines=True,
+        )
+        desc_table.add_column("Username",    style="bold yellow", width=22)
+        desc_table.add_column("Description", style="white")
+        for f in desc:
+            desc_table.add_row(f["username"], f["description"])
+        console.print(desc_table)
+
+    # ── SPN list ──────────────────────────────────────────────
+    spns = result["spns"]
+    if spns:
+        spn_table = Table(
+            title="[bold bright_cyan]Kerberoastable SPNs[/bold bright_cyan]",
+            box=box.SIMPLE,
+            border_style="bright_blue",
+            show_lines=True,
+        )
+        spn_table.add_column("Username", style="bold yellow", width=22)
+        spn_table.add_column("SPN",      style="white")
+        for s in spns:
+            spn_table.add_row(s["username"], s["spn"])
+        console.print(spn_table)
+
+    # ── Warnings ──────────────────────────────────────────────
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+
+    console.print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,15 +533,17 @@ def assessment_menu(state: AssessmentState) -> None:
         console.print()
 
         console.print("[bold bright_cyan]Assessment Menu[/bold bright_cyan]\n")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan")
-        console.print("  [bright_cyan]2.[/bright_cyan]  Execute Suggested Action")
-        console.print("  [bright_cyan]3.[/bright_cyan]  View Findings Log")
-        console.print("  [bright_cyan]4.[/bright_cyan]  Save & Return to Main Menu")
+        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan (nmap)")
+        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration")
+        console.print("  [bright_cyan]3.[/bright_cyan]  Execute Suggested Action")
+        console.print("  [bright_cyan]4.[/bright_cyan]  View Findings Log")
+        console.print("  [bright_cyan]5.[/bright_cyan]  SMB Enumeration")
+        console.print("  [bright_cyan]6.[/bright_cyan]  Save & Return to Main Menu")
         console.print()
 
         choice = Prompt.ask(
             "  [bold yellow]Select option[/bold yellow]",
-            choices=["1", "2", "3", "4"],
+            choices=["1", "2", "3", "4", "5", "6"],
             show_choices=False,
         )
 
@@ -457,12 +553,23 @@ def assessment_menu(state: AssessmentState) -> None:
             save_session(state)
 
         elif choice == "2":
-            execute_suggested_action(state)
+            from modules.ldap_enum_module import run as ldap_run
+            result = ldap_run(state)
+            _display_ldap_results(result)
+            save_session(state)
 
         elif choice == "3":
-            _display_findings_log(state)
+            execute_suggested_action(state)
 
         elif choice == "4":
+            _display_findings_log(state)
+
+        elif choice == "5":
+            from modules.smb_enum_module import run as smb_run
+            smb_run(state)
+            save_session(state)
+
+        elif choice == "6":
             path = save_session(state)
             console.print(
                 f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n"

@@ -44,6 +44,14 @@ class AssessmentState:
     asrep_users: list[str] = field(default_factory=list)
     vulnerabilities: list[dict] = field(default_factory=list)
 
+    # Extracted hashes — populated by AS-REP Roasting + Kerberoasting modules.
+    # Each entry: {"type": "asrep"|"tgs", "username": str, "hash": str, "spn": str (tgs only)}
+    hashes: list[dict] = field(default_factory=list)
+
+    # Cracked passwords — populated when hash is cracked.
+    # Each entry: {"username": str, "password": str, "source": str}
+    cracked_passwords: list[dict] = field(default_factory=list)
+
     # Audit trail
     performed_actions: list[str] = field(default_factory=list)
     findings_log: list[dict] = field(default_factory=list)
