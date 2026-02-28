@@ -9,7 +9,7 @@ import sys
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt
 from rich.table import Table
 from rich import box
 from rich.text import Text
@@ -24,6 +24,60 @@ from session import (
 )
 
 console = Console()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Action dispatcher
+# Maps suggestion action_key → callable that accepts AssessmentState
+# Add new modules here as they are built — nowhere else needs to change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dispatch_action(action_key: str, state: AssessmentState) -> None:
+    """
+    Route a suggestion action_key to its implementing module.
+    Each handler imports lazily so missing modules never crash the menu.
+    """
+    key = action_key.lower().strip()
+
+    if key == "portscan":
+        from modules.nmap_module import run as nmap_run
+        nmap_run(state)
+
+    elif key == "kerberoasting":
+        console.print("\n  [yellow]⚠  Kerberoasting module not yet implemented.[/yellow]\n")
+
+    elif key == "asreproasting":
+        console.print("\n  [yellow]⚠  AS-REP Roasting module not yet implemented.[/yellow]\n")
+
+    elif key == "ldap_enum":
+        console.print("\n  [yellow]⚠  LDAP Enumeration module not yet implemented.[/yellow]\n")
+
+    elif key == "smb_enum":
+        console.print("\n  [yellow]⚠  SMB Enumeration module not yet implemented.[/yellow]\n")
+
+    elif key == "smbrelay":
+        console.print("\n  [yellow]⚠  SMB Relay module not yet implemented.[/yellow]\n")
+
+    elif key == "winrm":
+        console.print("\n  [yellow]⚠  WinRM module not yet implemented.[/yellow]\n")
+
+    elif key == "spraying":
+        console.print("\n  [yellow]⚠  Password Spraying module not yet implemented.[/yellow]\n")
+
+    elif key == "passthehash":
+        console.print("\n  [yellow]⚠  Pass-the-Hash module not yet implemented.[/yellow]\n")
+
+    elif key == "rdp":
+        console.print("\n  [yellow]⚠  RDP module not yet implemented.[/yellow]\n")
+
+    elif key == "mssql":
+        console.print("\n  [yellow]⚠  MSSQL module not yet implemented.[/yellow]\n")
+
+    elif key == "adws":
+        console.print("\n  [yellow]⚠  AD Web Services module not yet implemented.[/yellow]\n")
+
+    else:
+        console.print(f"\n  [red]✘  No dispatcher found for action key: '{key}'[/red]\n")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner / Header helpers
@@ -48,19 +102,35 @@ def print_banner() -> None:
 
 def print_assessment_header(state: AssessmentState) -> None:
     """Print a status header for the current assessment session."""
-    table = Table(box=box.ROUNDED, show_header=False, border_style="bright_blue", expand=False)
-    table.add_column("Key", style="bold bright_cyan", width=18)
+    table = Table(
+        box=box.ROUNDED,
+        show_header=False,
+        border_style="bright_blue",
+        expand=False,
+    )
+    table.add_column("Key",   style="bold bright_cyan", width=18)
     table.add_column("Value", style="white")
 
     table.add_row("Assessment ID", state.assessment_id)
-    table.add_row("Target IP", state.target_ip)
-    table.add_row("Domain", state.domain)
+    table.add_row("Target IP",     state.target_ip)
+    table.add_row("Domain",        state.domain)
     if state.dns_server:
         table.add_row("DNS Server", state.dns_server)
     if state.initial_credentials.username:
         table.add_row("Username", state.initial_credentials.username)
+    if state.open_ports:
+        table.add_row(
+            "Open Ports",
+            ", ".join(str(p) for p in sorted(state.open_ports)),
+        )
 
-    console.print(Panel(table, title="[bold bright_cyan]Current Session[/bold bright_cyan]", border_style="bright_blue"))
+    console.print(
+        Panel(
+            table,
+            title="[bold bright_cyan]Current Session[/bold bright_cyan]",
+            border_style="bright_blue",
+        )
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,12 +148,49 @@ def _prompt_required(label: str) -> str:
 
 def _prompt_optional(label: str, default: str = "") -> str:
     """Prompt for an optional value, returning default if left blank."""
-    value = Prompt.ask(
+    return Prompt.ask(
         f"  [bold dim]{label}[/bold dim]",
         default=default,
         show_default=bool(default),
     ).strip()
-    return value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Suggestion display
+# ─────────────────────────────────────────────────────────────────────────────
+
+PRIORITY_COLORS = {
+    "critical": "bold red",
+    "high":     "bold yellow",
+    "medium":   "bright_cyan",
+    "low":      "dim",
+}
+
+
+def _display_suggestions(suggestions: list[dict]) -> None:
+    """Render the current suggestion list as a numbered rich table."""
+    table = Table(
+        title="[bold bright_cyan]Suggested Next Actions[/bold bright_cyan]",
+        box=box.ROUNDED,
+        border_style="bright_blue",
+        show_lines=True,
+        expand=False,
+    )
+    table.add_column("#",        style="bold bright_cyan", width=4)
+    table.add_column("Priority", width=10)
+    table.add_column("Action",   style="white", width=36)
+    table.add_column("Reason",   style="dim")
+
+    for idx, s in enumerate(suggestions, start=1):
+        color = PRIORITY_COLORS.get(s["priority"], "white")
+        table.add_row(
+            str(idx),
+            f"[{color}]{s['priority'].upper()}[/{color}]",
+            s["action"],
+            s["reason"],
+        )
+
+    console.print(table)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,14 +202,14 @@ def start_new_assessment() -> AssessmentState:
     console.print()
 
     target_ip = _prompt_required("Target Domain Controller IP")
-    domain = _prompt_required("Domain Name (e.g. corp.local)")
+    domain    = _prompt_required("Domain Name (e.g. corp.local)")
 
     console.print("\n  [dim]Optional fields — press Enter to skip.[/dim]\n")
     dns_server = _prompt_optional("DNS Server IP")
-    username = _prompt_optional("Username")
+    username   = _prompt_optional("Username")
 
-    password = ""
-    ntlm_hash = ""
+    password   = ""
+    ntlm_hash  = ""
     if username:
         auth_choice = Prompt.ask(
             "  [bold dim]Auth method[/bold dim]",
@@ -110,7 +217,7 @@ def start_new_assessment() -> AssessmentState:
             default="none",
         )
         if auth_choice == "password":
-            password = Prompt.ask("  [bold dim]Password[/bold dim]", password=True)
+            password  = Prompt.ask("  [bold dim]Password[/bold dim]", password=True)
         elif auth_choice == "hash":
             ntlm_hash = _prompt_optional("NTLM Hash (LM:NT format)")
 
@@ -126,7 +233,9 @@ def start_new_assessment() -> AssessmentState:
     )
 
     path = save_session(state)
-    console.print(f"\n  [bold green]✔  Session created and saved:[/bold green] [dim]{path}[/dim]\n")
+    console.print(
+        f"\n  [bold green]✔  Session created and saved:[/bold green] [dim]{path}[/dim]\n"
+    )
     return state
 
 
@@ -148,20 +257,25 @@ def load_existing_assessment() -> AssessmentState | None:
         border_style="bright_blue",
         show_lines=True,
     )
-    table.add_column("#", style="bold bright_cyan", width=4)
+    table.add_column("#",             style="bold bright_cyan", width=4)
     table.add_column("Assessment ID", style="white")
-    table.add_column("Target IP", style="green")
-    table.add_column("Domain", style="yellow")
+    table.add_column("Target IP",     style="green")
+    table.add_column("Domain",        style="yellow")
 
     for idx, sess in enumerate(sessions, start=1):
-        table.add_row(str(idx), sess["assessment_id"], sess["target_ip"], sess["domain"])
+        table.add_row(
+            str(idx),
+            sess["assessment_id"],
+            sess["target_ip"],
+            sess["domain"],
+        )
 
     console.print()
     console.print(table)
     console.print()
 
     choices = [str(i) for i in range(1, len(sessions) + 1)] + ["0"]
-    choice = Prompt.ask(
+    choice  = Prompt.ask(
         "  [bold yellow]Select session #[/bold yellow] (0 to cancel)",
         choices=choices,
         show_choices=False,
@@ -173,7 +287,9 @@ def load_existing_assessment() -> AssessmentState | None:
     selected = sessions[int(choice) - 1]
     try:
         state = load_session(selected["assessment_id"])
-        console.print(f"\n  [bold green]✔  Session loaded:[/bold green] {state.assessment_id}\n")
+        console.print(
+            f"\n  [bold green]✔  Session loaded:[/bold green] {state.assessment_id}\n"
+        )
         return state
     except FileNotFoundError as exc:
         console.print(f"\n  [red]Error: {exc}[/red]\n")
@@ -181,14 +297,141 @@ def load_existing_assessment() -> AssessmentState | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Assessment menu (placeholder for future modules)
+# Execute Suggested Action flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_suggested_action(state: AssessmentState) -> None:
+    """
+    Generate suggestions via SuggestionEngine, display them, let the user
+    pick one, dispatch to the matching module, and update state.
+    """
+    from modules.suggestion_engine import generate_suggestions
+
+    suggestions = generate_suggestions(state)
+
+    if not suggestions:
+        console.print(
+            "\n  [bold yellow]⚠  No further logical attack paths detected.[/bold yellow]\n"
+            "  [dim]Complete more enumeration steps or add credentials to unlock new paths.[/dim]\n"
+        )
+        return
+
+    console.print()
+    _display_suggestions(suggestions)
+    console.print()
+
+    choices = [str(i) for i in range(1, len(suggestions) + 1)] + ["0"]
+    choice  = Prompt.ask(
+        "  [bold yellow]Select action #[/bold yellow] (0 to cancel)",
+        choices=choices,
+        show_choices=False,
+    )
+
+    if choice == "0":
+        return
+
+    selected    = suggestions[int(choice) - 1]
+    action_name = selected["action"]
+    action_key  = _resolve_action_key(action_name)
+
+    console.rule(f"[bold bright_cyan]Executing: {action_name}[/bold bright_cyan]")
+    _dispatch_action(action_key, state)
+
+    # Record that this action was performed
+    state.log_action(action_name)
+    save_session(state)
+
+    # Regenerate and display updated suggestions
+    updated = generate_suggestions(state)
+    if updated:
+        console.print()
+        console.rule("[bold dim]Updated Suggestions[/bold dim]")
+        _display_suggestions(updated)
+    else:
+        console.print(
+            "\n  [bold green]✔  All currently actionable paths have been addressed.[/bold green]\n"
+        )
+
+
+def _resolve_action_key(action_name: str) -> str:
+    """
+    Map a human-readable suggestion action name back to its action_key.
+    Keeps dispatcher logic decoupled from display strings.
+    """
+    name = action_name.lower()
+
+    mapping = {
+        "kerberoasting":        "kerberoasting",
+        "as-rep roasting":      "asreproasting",
+        "winrm":                "winrm",
+        "password spraying":    "spraying",
+        "smb relay":            "smbrelay",
+        "pass-the-hash":        "passthehash",
+        "ldap enumeration":     "ldap_enum",
+        "smb enumeration":      "smb_enum",
+        "rdp":                  "rdp",
+        "mssql":                "mssql",
+        "ad web services":      "adws",
+        "run port":             "portscan",
+        "port & service scan":  "portscan",
+    }
+
+    for keyword, key in mapping.items():
+        if keyword in name:
+            return key
+
+    # Fallback: use first word
+    return name.split()[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Findings log display
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _display_findings_log(state: AssessmentState) -> None:
+    console.rule("[bold bright_cyan]Findings Log[/bold bright_cyan]")
+
+    if not state.findings_log:
+        console.print("\n  [dim]No findings logged yet.[/dim]\n")
+        return
+
+    severity_colors = {
+        "INFO":     "bright_blue",
+        "LOW":      "green",
+        "MEDIUM":   "yellow",
+        "HIGH":     "red",
+        "CRITICAL": "bold red",
+    }
+
+    table = Table(
+        box=box.SIMPLE,
+        show_lines=True,
+        border_style="bright_blue",
+    )
+    table.add_column("Timestamp",   style="dim",  width=20)
+    table.add_column("Severity",                  width=10)
+    table.add_column("Category",    style="cyan", width=16)
+    table.add_column("Description")
+
+    for entry in state.findings_log:
+        sev   = entry.get("severity", "INFO")
+        color = severity_colors.get(sev, "white")
+        table.add_row(
+            entry.get("timestamp",   ""),
+            f"[{color}]{sev}[/{color}]",
+            entry.get("category",    ""),
+            entry.get("description", ""),
+        )
+
+    console.print(table)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assessment menu
 # ─────────────────────────────────────────────────────────────────────────────
 
 def assessment_menu(state: AssessmentState) -> None:
-    """
-    Main interaction loop once an assessment is loaded.
-    Module integrations will be wired in here.
-    """
+    """Main interaction loop for an active assessment session."""
     while True:
         console.print()
         print_assessment_header(state)
@@ -196,17 +439,14 @@ def assessment_menu(state: AssessmentState) -> None:
 
         console.print("[bold bright_cyan]Assessment Menu[/bold bright_cyan]\n")
         console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan")
-        console.print("  [bright_cyan]2.[/bright_cyan]  User Enumeration             [dim](coming soon)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  Kerberoasting                [dim](coming soon)[/dim]")
-        console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting              [dim](coming soon)[/dim]")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Vulnerability Checks         [dim](coming soon)[/dim]")
-        console.print("  [bright_cyan]6.[/bright_cyan]  View Findings Log")
-        console.print("  [bright_cyan]7.[/bright_cyan]  Save & Return to Main Menu")
+        console.print("  [bright_cyan]2.[/bright_cyan]  Execute Suggested Action")
+        console.print("  [bright_cyan]3.[/bright_cyan]  View Findings Log")
+        console.print("  [bright_cyan]4.[/bright_cyan]  Save & Return to Main Menu")
         console.print()
 
         choice = Prompt.ask(
             "  [bold yellow]Select option[/bold yellow]",
-            choices=["1", "2", "3", "4", "5", "6", "7"],
+            choices=["1", "2", "3", "4"],
             show_choices=False,
         )
 
@@ -215,50 +455,18 @@ def assessment_menu(state: AssessmentState) -> None:
             nmap_run(state)
             save_session(state)
 
-        elif choice in ("2", "3", "4", "5"):
-            console.print("\n  [yellow]⚠  This module is not yet implemented.[/yellow]")
-            console.print("  [dim]Stub hook is ready — drop a module in and wire it here.[/dim]\n")
+        elif choice == "2":
+            execute_suggested_action(state)
 
-        elif choice == "6":
+        elif choice == "3":
             _display_findings_log(state)
 
-        elif choice == "7":
+        elif choice == "4":
             path = save_session(state)
-            console.print(f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n")
+            console.print(
+                f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n"
+            )
             break
-
-
-def _display_findings_log(state: AssessmentState) -> None:
-    console.rule("[bold bright_cyan]Findings Log[/bold bright_cyan]")
-    if not state.findings_log:
-        console.print("\n  [dim]No findings logged yet.[/dim]\n")
-        return
-
-    table = Table(box=box.SIMPLE, show_lines=True, border_style="bright_blue")
-    table.add_column("Timestamp", style="dim", width=20)
-    table.add_column("Severity", width=8)
-    table.add_column("Category", style="cyan", width=16)
-    table.add_column("Description")
-
-    severity_colors = {
-        "INFO": "bright_blue",
-        "LOW": "green",
-        "MEDIUM": "yellow",
-        "HIGH": "red",
-        "CRITICAL": "bold red",
-    }
-
-    for entry in state.findings_log:
-        sev = entry.get("severity", "INFO")
-        color = severity_colors.get(sev, "white")
-        table.add_row(
-            entry.get("timestamp", ""),
-            f"[{color}]{sev}[/{color}]",
-            entry.get("category", ""),
-            entry.get("description", ""),
-        )
-
-    console.print(table)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
