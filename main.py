@@ -43,10 +43,16 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         nmap_run(state)
 
     elif key == "kerberoasting":
-        console.print("\n  [yellow]⚠  Kerberoasting module not yet implemented.[/yellow]\n")
+        from modules.kerberoasting_module import run as kerb_run
+        result = kerb_run(state)
+        _display_kerb_results(result)
+        save_session(state)
 
     elif key == "asreproasting":
-        console.print("\n  [yellow]⚠  AS-REP Roasting module not yet implemented.[/yellow]\n")
+        from modules.asrep_roasting_module import run as asrep_run
+        result = asrep_run(state)
+        _display_asrep_results(result)
+        save_session(state)
 
     elif key == "ldap_enum":
         from modules.ldap_enum_module import run as ldap_run
@@ -64,7 +70,23 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         console.print("\n  [yellow]⚠  WinRM module not yet implemented.[/yellow]\n")
 
     elif key == "spraying":
-        console.print("\n  [yellow]⚠  Password Spraying module not yet implemented.[/yellow]\n")
+        from modules.password_spray_module import run as spray_run
+        passwords = Prompt.ask(
+            "  [bold yellow]Password(s) to spray[/bold yellow] "
+            "[dim](comma-separated)[/dim]"
+        ).split(",")
+        passwords = [p.strip() for p in passwords if p.strip()]
+        if passwords:
+            preview = spray_run(state, passwords=passwords, confirmed=False)
+            _display_spray_results(preview)
+            confirm = Prompt.ask(
+                "\n  [bold red]Execute spray?[/bold red] [dim](yes/no)[/dim]",
+                choices=["yes", "no"], default="no",
+            )
+            if confirm == "yes":
+                result = spray_run(state, passwords=passwords, confirmed=True)
+                _display_spray_results(result)
+                save_session(state)
 
     elif key == "passthehash":
         console.print("\n  [yellow]⚠  Pass-the-Hash module not yet implemented.[/yellow]\n")
@@ -288,9 +310,114 @@ def _display_ldap_results(result: dict) -> None:
     console.print()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# New Assessment flow
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Attack module result display functions
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _display_asrep_results(result: dict) -> None:
+    """Display AS-REP Roasting results from asrep_roasting_module."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  AS-REP Roasting failed:[/bold red] {result['error']}\n")
+        return
+
+    hashes = result["hashes"]
+    table  = Table(
+        title="[bold bright_cyan]AS-REP Roasting Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=20)
+    table.add_column("Value",    style="white")
+    table.add_row("Mode",    result["mode"].upper())
+    table.add_row("Hashes",  f"[bold red]{len(hashes)} captured[/bold red]" if hashes else "[green]None[/green]")
+    table.add_row("Saved to", result["hash_file"] or "N/A")
+    console.print(); console.print(table)
+
+    if hashes:
+        console.print(f"\n  [bold yellow]Crack command:[/bold yellow]")
+        console.print(f"  [dim]{result['crack_command']}[/dim]\n")
+        for h in hashes[:5]:
+            console.print(f"  [dim]{h[:100]}[/dim]")
+        if len(hashes) > 5:
+            console.print(f"  [dim]... and {len(hashes)-5} more in file[/dim]")
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_kerb_results(result: dict) -> None:
+    """Display Kerberoasting results from kerberoasting_module."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  Kerberoasting failed:[/bold red] {result['error']}\n")
+        return
+
+    hashes = result["hashes"]
+    table  = Table(
+        title="[bold bright_cyan]Kerberoasting Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=20)
+    table.add_column("Value",    style="white")
+    table.add_row("TGS Tickets", f"[bold red]{len(hashes)} captured[/bold red]" if hashes else "[green]None[/green]")
+    table.add_row("Saved to",   result["hash_file"] or "N/A")
+    console.print(); console.print(table)
+
+    if hashes:
+        spn_table = Table(box=box.SIMPLE, border_style="bright_blue", show_lines=True)
+        spn_table.add_column("Username", style="bold yellow", width=22)
+        spn_table.add_column("SPN",      style="white")
+        for entry in hashes:
+            spn_table.add_row(entry["username"], entry["spn"])
+        console.print(spn_table)
+        console.print(f"\n  [bold yellow]Crack command:[/bold yellow]")
+        console.print(f"  [dim]{result['crack_command']}[/dim]\n")
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_spray_results(result: dict) -> None:
+    """Display Password Spray results from password_spray_module."""
+    status = result["status"]
+
+    if status == "error":
+        console.print(f"\n  [bold red]✘  Password Spray failed:[/bold red] {result['error']}\n")
+        return
+
+    if status == "dry_run":
+        console.print("\n  [bold yellow]⚠  DRY RUN — spray NOT executed[/bold yellow]")
+        for w in result["warnings"]:
+            console.print(f"  [dim]{w}[/dim]")
+        console.print()
+        return
+
+    valid = result["valid_creds"]
+    table = Table(
+        title="[bold bright_cyan]Password Spray Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=22)
+    table.add_column("Value",    style="white")
+    table.add_row("Users Tested",     str(result["user_count"]))
+    table.add_row("Rounds",           str(result["spray_rounds"]))
+    table.add_row("Valid Creds Found", f"[bold red]{len(valid)}[/bold red]" if valid else "[green]None[/green]")
+    table.add_row("Lockout Detected", "[bold red]YES — SPRAY STOPPED[/bold red]" if result["lockout_detected"] else "[green]No[/green]")
+    console.print(); console.print(table)
+
+    if valid:
+        cred_table = Table(box=box.SIMPLE, border_style="red", show_lines=True)
+        cred_table.add_column("Username", style="bold yellow", width=22)
+        cred_table.add_column("Password", style="bold red")
+        for c in valid:
+            cred_table.add_row(c["username"], c["password"])
+        console.print(cred_table)
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
 
 def start_new_assessment() -> AssessmentState:
     console.rule("[bold bright_cyan]New Assessment Setup[/bold bright_cyan]")
@@ -535,15 +662,18 @@ def assessment_menu(state: AssessmentState) -> None:
         console.print("[bold bright_cyan]Assessment Menu[/bold bright_cyan]\n")
         console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan (nmap)")
         console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration")
-        console.print("  [bright_cyan]3.[/bright_cyan]  Execute Suggested Action")
-        console.print("  [bright_cyan]4.[/bright_cyan]  View Findings Log")
-        console.print("  [bright_cyan]5.[/bright_cyan]  SMB Enumeration")
-        console.print("  [bright_cyan]6.[/bright_cyan]  Save & Return to Main Menu")
+        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute Force")
+        console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting")
+        console.print("  [bright_cyan]5.[/bright_cyan]  Kerberoasting")
+        console.print("  [bright_cyan]6.[/bright_cyan]  Password Spraying")
+        console.print("  [bright_cyan]7.[/bright_cyan]  Execute Suggested Action")
+        console.print("  [bright_cyan]8.[/bright_cyan]  View Findings Log")
+        console.print("  [bright_cyan]9.[/bright_cyan]  Save & Return to Main Menu")
         console.print()
 
         choice = Prompt.ask(
             "  [bold yellow]Select option[/bold yellow]",
-            choices=["1", "2", "3", "4", "5", "6"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
             show_choices=False,
         )
 
@@ -559,17 +689,48 @@ def assessment_menu(state: AssessmentState) -> None:
             save_session(state)
 
         elif choice == "3":
-            execute_suggested_action(state)
-
-        elif choice == "4":
-            _display_findings_log(state)
-
-        elif choice == "5":
             from modules.smb_enum_module import run as smb_run
             smb_run(state)
             save_session(state)
 
+        elif choice == "4":
+            from modules.asrep_roasting_module import run as asrep_run
+            result = asrep_run(state)
+            _display_asrep_results(result)
+            save_session(state)
+
+        elif choice == "5":
+            from modules.kerberoasting_module import run as kerb_run
+            result = kerb_run(state)
+            _display_kerb_results(result)
+            save_session(state)
+
         elif choice == "6":
+            passwords = Prompt.ask(
+                "  [bold yellow]Password(s) to spray[/bold yellow] "
+                "[dim](comma-separated, e.g. Password123!)[/dim]"
+            ).split(",")
+            passwords = [p.strip() for p in passwords if p.strip()]
+            if passwords:
+                from modules.password_spray_module import run as spray_run
+                preview = spray_run(state, passwords=passwords, confirmed=False)
+                _display_spray_results(preview)
+                confirm = Prompt.ask(
+                    "\n  [bold red]Execute spray?[/bold red]",
+                    choices=["yes", "no"], default="no",
+                )
+                if confirm == "yes":
+                    result = spray_run(state, passwords=passwords, confirmed=True)
+                    _display_spray_results(result)
+                    save_session(state)
+
+        elif choice == "7":
+            execute_suggested_action(state)
+
+        elif choice == "8":
+            _display_findings_log(state)
+
+        elif choice == "9":
             path = save_session(state)
             console.print(
                 f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n"

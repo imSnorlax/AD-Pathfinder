@@ -246,6 +246,46 @@ def _parse_nxc_shares(output: str) -> list[str]:
     return shares
 
 
+def _parse_rid_brute_output(output: str) -> tuple[list[str], list[str]]:
+    """
+    Parse usernames and group names from nxc/crackmapexec --rid-brute output.
+
+    nxc RID brute line format:
+        SMB  192.168.11.116  445  DC01  VulnAd\\Administrator (SidTypeUser)
+        SMB  192.168.11.116  445  DC01  VulnAd\\Domain Admins (SidTypeGroup)
+        SMB  192.168.11.116  445  DC01  VulnAd\\krbtgt (SidTypeUser)
+
+    We extract the name after the last backslash and before the '(' marker,
+    mirroring the user's playbook pipeline:
+        cut -d '\\' -f2 | cut -d '(' -f1 | sed 's/ *$//'
+    """
+    users:  list[str] = []
+    groups: list[str] = []
+    seen:   set[str]  = set()
+
+    # Match lines containing SidTypeUser or SidTypeGroup
+    pattern = re.compile(
+        r"SMB\s+\S+\s+\d+\s+\S+\s+\S+\\(.+?)\s+\(SidType(User|Group|Alias)\)",
+        re.IGNORECASE,
+    )
+
+    for match in pattern.finditer(output):
+        name     = match.group(1).strip()
+        sid_type = match.group(2).lower()
+
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        if sid_type == "user":
+            users.append(name)
+        else:          # group / alias
+            groups.append(name)
+
+    return users, groups
+
+
+
 def _build_suggestions(
     anonymous_access: bool,
     smb_signing: Optional[bool],
@@ -381,12 +421,32 @@ class SMBEnumerationModule:
         # ── D) SMB signing check via nxc/crackmapexec ──────────────────
         smb_signing, smb_version = self._cme_signing_check(target, creds)
 
+        # ── E) RID brute force for users + groups ────────────────────────
+        # nxc smb target -u guest -p '' --rid-brute
+        # Gives us full user and group lists even without LDAP.
+        rid_users, rid_groups = self._rid_brute_check(target)
+
+        if rid_users:
+            if _RICH_AVAILABLE:
+                console.print(
+                    f"  [dim]→ RID brute force: {len(rid_users)} users, "
+                    f"{len(rid_groups)} groups discovered.[/dim]"
+                )
+            # Save to reports/ for use by attack modules
+            os.makedirs("reports", exist_ok=True)
+            users_path  = os.path.join("reports", f"{state.assessment_id}-users-rid.txt")
+            groups_path = os.path.join("reports", f"{state.assessment_id}-groups-rid.txt")
+            with open(users_path,  "w") as f: f.write("\n".join(rid_users)  + "\n")
+            with open(groups_path, "w") as f: f.write("\n".join(rid_groups) + "\n")
+
         # ── Compile findings ───────────────────────────────────────────
         findings = {
             "shares":           shares,
             "anonymous_access": anonymous_access,
             "smb_signing":      smb_signing,
             "smb_version":      smb_version,
+            "rid_users":        rid_users,
+            "rid_groups":       rid_groups,
         }
 
         suggestions = _build_suggestions(
@@ -416,8 +476,25 @@ class SMBEnumerationModule:
             state.log_finding(
                 category="SMB",
                 description=(
-                    f"Anonymous (null session) access allowed on {target}. "
+                    f"Anonymous/guest access allowed on {target}. "
                     f"Accessible shares: {', '.join(shares) if shares else 'none listed'}."
+                ),
+                severity="MEDIUM",
+            )
+
+        if rid_users:
+            existing_users = set(state.users)
+            new_users = [u for u in rid_users if u not in existing_users]
+            state.users.extend(new_users)
+
+            existing_groups = set(state.groups)
+            state.groups.extend(g for g in rid_groups if g not in existing_groups)
+
+            state.log_finding(
+                category="SMB",
+                description=(
+                    f"RID brute force: {len(rid_users)} users, {len(rid_groups)} groups discovered "
+                    f"via guest auth on {target}."
                 ),
                 severity="MEDIUM",
             )
@@ -471,6 +548,42 @@ class SMBEnumerationModule:
         ])
 
         return _parse_smbclient_output(result["output"], result["error"])
+
+    def _rid_brute_check(self, target: str) -> tuple[list[str], list[str]]:
+        """
+        Enumerate all domain users and groups via RID brute force.
+
+        Runs: nxc smb <target> -u guest -p '' --rid-brute
+        Parses lines with SidTypeUser and SidTypeGroup.
+
+        Returns
+        -------
+        tuple[list[str], list[str]]
+            (usernames, group_names)  — clean names without domain prefix.
+        """
+        cme_bin = None
+        for binary in ("nxc", "crackmapexec", "cme"):
+            if self.executor.check_tool(binary):
+                cme_bin = binary
+                break
+
+        if not cme_bin:
+            return [], []
+
+        if _RICH_AVAILABLE:
+            console.print("  [dim]→ Running RID brute force (guest auth)...[/dim]")
+
+        command = [
+            cme_bin, "smb", target,
+            "-u", "guest",
+            "-p", "",
+            "--rid-brute",
+        ]
+
+        result   = self.executor.run(command)
+        combined = result["output"] + "\n" + result["error"]
+
+        return _parse_rid_brute_output(combined)
 
     def _authenticated_share_check(
         self,
