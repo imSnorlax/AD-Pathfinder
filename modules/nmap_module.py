@@ -233,7 +233,6 @@ class NmapScanner:
             "-Pn",      # skip host discovery (DC may block ping)
             "-sS",      # SYN scan (requires root)
             "-sV",      # service/version detection
-            "-p-",      # all 65535 ports
             "--open",   # show only open ports
             "-T5",      # insane timing — fastest scan speed
             target,
