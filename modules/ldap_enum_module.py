@@ -295,25 +295,42 @@ class LDAPEnumerationModule:
         )
 
         # ── Step B: Choose query auth mode ────────────────────────────
+        # Bind priority: anonymous → guest (user=guest, pass='') → stored creds → fail
         has_creds = bool(creds.username and (creds.password or creds.ntlm_hash))
 
+        # Guest-account check: many DCs deny true anonymous bind but accept
+        # guest login with an empty password.  Try it before giving up.
+        guest_ok  = False
+        guest_cred = None
+        if not anon_ok and not has_creds:
+            guest_ok = self._try_guest_bind(target, base_dn, port, use_ldaps)
+            if guest_ok:
+                from session import Credentials as _Creds
+                guest_cred = _Creds(username="guest", password="")
+                warnings.append(
+                    "Anonymous bind denied; guest account (user=guest, pass='') "
+                    "accepted. Enumerating as guest."
+                )
+
         if anon_ok:
-            # Use anonymous to pull users, then groups, then SPNs
-            user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=None)
-            group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=None)
-            spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=None)
+            # True anonymous — most permissive
+            bind_creds = None
+            bind_label = "anonymous"
+        elif guest_ok:
+            bind_creds = guest_cred
+            bind_label = "guest"
         elif has_creds:
-            # Fallback to authenticated queries
+            # Stored credentials from assessment setup
+            bind_creds = creds
+            bind_label = f"{creds.username}"
             warnings.append(
                 "Anonymous bind was denied; falling back to authenticated queries."
             )
-            user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=creds)
-            group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=creds)
-            spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=creds)
         else:
             warnings.append(
-                "Anonymous bind denied and no credentials available. "
-                "Supply credentials to enable authenticated LDAP enumeration."
+                "Anonymous bind denied, guest login failed, and no credentials stored. "
+                "Re-run after adding credentials via 'Start New Assessment' or supply "
+                "valid creds to the session."
             )
             return {
                 "status":        "error",
@@ -324,9 +341,16 @@ class LDAPEnumerationModule:
                 "groups":        [],
                 "spns":          [],
                 "desc_findings": [],
-                "error":         "LDAP bind failed: anonymous and no credentials.",
+                "error": (
+                    "LDAP bind failed: anonymous denied, guest rejected, "
+                    "no credentials available."
+                ),
                 "warnings":      warnings,
             }
+
+        user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=bind_creds)
+        group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds)
+        spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds)
 
         # ── Step C: Parse results ──────────────────────────────────────
         user_entries  = _parse_ldif_entries(user_raw)
@@ -495,8 +519,9 @@ class LDAPEnumerationModule:
             # Disable certificate validation — assessment context, not production
             args += ["-o", "TLS_REQCERT=never"]
 
-        if creds and creds.username and creds.password:
-            # Build bind DN — try user@domain format (most compatible)
+        if creds and creds.username:
+            # Both password and empty-string password ("") are valid:
+            # guest authentication uses user=guest with an empty password.
             bind_dn = (
                 f"{creds.username}@{creds.username.split('@')[-1]}"
                 if "@" in creds.username
@@ -545,6 +570,45 @@ class LDAPEnumerationModule:
 
         success = result["exit_code"] == 0 and not failed
         return success, result["output"], result["error"]
+
+    def _try_guest_bind(
+        self,
+        target:    str,
+        base_dn:   str,
+        port:      int,
+        use_ldaps: bool,
+    ) -> bool:
+        """
+        Attempt an LDAP bind using 'guest' account with an empty password.
+        Many DCs block anonymous (no credentials) but accept guest login,
+        which grants the same read access for enumeration purposes.
+
+        Returns True if the bind succeeds.
+        """
+        from session import Credentials as _Creds
+        guest = _Creds(username="guest", password="")
+
+        args = self._build_base_args(target, port, use_ldaps, creds=guest)
+        args += [
+            "-b", "",
+            "-s", "base",
+            "(objectClass=*)",
+            "namingContexts",
+        ]
+
+        result = self.executor.run(args)
+
+        denied_patterns = [
+            "invalid credentials",
+            "ldap_bind:",
+            "can't contact ldap server",
+            "operations error",
+            "unwilling to perform",
+        ]
+        err_lower = result["error"].lower() + result["output"].lower()
+        failed = any(p in err_lower for p in denied_patterns)
+
+        return result["exit_code"] == 0 and not failed
 
     def _query_users(
         self,

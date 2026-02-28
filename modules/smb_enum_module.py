@@ -212,8 +212,39 @@ def _parse_crackmapexec_output(output: str) -> tuple[Optional[bool], str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Suggestion builder
+# nxc share output parser
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_nxc_shares(output: str) -> list[str]:
+    """
+    Parse share names from nxc/crackmapexec --shares output.
+
+    nxc output line format:
+        SMB  192.168.11.116  445  DC01  ADMIN$          Remote Admin
+        SMB  192.168.11.116  445  DC01  Common  READ,WRITE
+
+    The share name is the 5th whitespace-delimited token on lines that
+    start with the SMB protocol tag.
+    """
+    shares: list[str] = []
+    seen:   set[str]  = set()
+
+    share_line_re = re.compile(
+        r"^\s*SMB\s+\S+\s+\d+\s+\S+\s+(\S+)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    for match in share_line_re.finditer(output):
+        name = match.group(1).strip()
+        # Skip status-marker tokens like [*], [+], [-]
+        if name.startswith("["):
+            continue
+        if name not in seen:
+            shares.append(name)
+            seen.add(name)
+
+    return shares
+
 
 def _build_suggestions(
     anonymous_access: bool,
@@ -329,11 +360,25 @@ class SMBEnumerationModule:
         # ── A) Null session / share enumeration ────────────────────────
         anonymous_access, shares = self._null_session_check(target)
 
-        # ── B) Authenticated share listing (if credentials available) ──
+        # ── B) Guest share enum via nxc (user=guest, pass='') ────────────
+        # Many DCs block true null sessions (smbclient -N) but allow guest
+        # authentication.  Try nxc --shares with guest before falling back
+        # to stored credentials.
+        if not shares:
+            guest_shares = self._nxc_guest_share_check(target)
+            if guest_shares:
+                shares = guest_shares
+                anonymous_access = True  # guest-level access is effectively anonymous
+                if _RICH_AVAILABLE:
+                    console.print(
+                        "  [dim]→ Null session denied; guest auth via nxc succeeded.[/dim]"
+                    )
+
+        # ── C) Authenticated share listing (if stored credentials available) ──
         if not shares and (creds.username and (creds.password or creds.ntlm_hash)):
             _, shares = self._authenticated_share_check(target, creds)
 
-        # ── C) SMB signing check via crackmapexec ──────────────────────
+        # ── D) SMB signing check via nxc/crackmapexec ──────────────────
         smb_signing, smb_version = self._cme_signing_check(target, creds)
 
         # ── Compile findings ───────────────────────────────────────────
@@ -465,6 +510,51 @@ class SMBEnumerationModule:
 
         result = self.executor.run(command)
         return _parse_smbclient_output(result["output"], result["error"])
+
+    def _nxc_guest_share_check(self, target: str) -> list[str]:
+        """
+        Attempt share enumeration using nxc/crackmapexec with guest credentials
+        (user='guest', password='').
+
+        This succeeds on many DCs that block true null sessions but leave the
+        built-in Guest account enabled — the exact scenario where smbclient -N
+        returns access denied but ``nxc smb target -u guest -p '' --shares``
+        works.
+
+        Returns
+        -------
+        list[str]
+            Share names discovered, or an empty list if unavailable/denied.
+        """
+        cme_bin = None
+        for binary in ("nxc", "crackmapexec", "cme"):
+            if self.executor.check_tool(binary):
+                cme_bin = binary
+                break
+
+        if not cme_bin:
+            return []
+
+        if _RICH_AVAILABLE:
+            console.print(
+                f"  [dim]→ Trying guest share enumeration via {cme_bin}...[/dim]"
+            )
+
+        command = [
+            cme_bin, "smb", target,
+            "-u", "guest",
+            "-p", "",
+            "--shares",
+        ]
+
+        result = self.executor.run(command)
+        combined = result["output"] + result["error"]
+
+        # A successful guest auth shows [+] in the output
+        if "[+]" not in combined and result["exit_code"] != 0:
+            return []
+
+        return _parse_nxc_shares(combined)
 
     def _cme_signing_check(
         self,
