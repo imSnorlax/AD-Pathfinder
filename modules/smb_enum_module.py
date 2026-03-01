@@ -72,17 +72,14 @@ def parse_rid_output(raw: str) -> tuple[list[str], list[str]]:
     """
     Parse nxc/crackmapexec --rid-brute output into (users, groups).
 
-    Extracts the name after the domain backslash and before the '(' SidType
-    marker, mirroring the playbook pipeline:
-        cut -d '\\' -f2 | cut -d '(' -f1 | sed 's/ *$//'
+    Handles nxc line format:
+        SMB  192.168.11.116  445  DC01  1103: VULNAD\\delora.else (SidTypeUser)
+        SMB  192.168.11.116  445  DC01  1173: VULNAD\\Office Admin (SidTypeGroup)
 
-    Machine accounts (ending in '$') are excluded from the user list — they
-    are irrelevant for password spraying or AS-REP roasting.
+    Strategy: scan each line for "\\<name> (SidType...)" — works regardless
+    of how many prefix tokens (SMB / IP / port / host / RID:) precede the name.
 
-    Parameters
-    ----------
-    raw : str
-        Raw combined stdout + stderr from the nxc --rid-brute call.
+    Machine accounts (ending in '$') are excluded — not useful for spraying.
 
     Returns
     -------
@@ -93,12 +90,21 @@ def parse_rid_output(raw: str) -> tuple[list[str], list[str]]:
     groups: list[str] = []
     seen:   set[str]  = set()
 
+    # Match: any backslash, capture everything up to " (SidTypeXxx)"
+    # Works on both full nxc lines and bare "RID: DOMAIN\name (SidType)" lines
     pattern = re.compile(
-        r"SMB\s+\S+\s+\d+\s+\S+\s+\S+\\(.+?)\s+\(SidType(User|Group|Alias)\)",
+        r"\\([^\\(\n]+?)\s+\(SidType(User|Group|Alias)\)",
         re.IGNORECASE,
     )
 
-    for match in pattern.finditer(raw):
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+
         name     = match.group(1).strip()
         sid_type = match.group(2).lower()
 
@@ -255,13 +261,20 @@ def _assessment_report_dir(assessment_id: str) -> str:
 
 
 def _write_users_file(assessment_id: str, users: list[str]) -> str:
-    """
-    Write clean usernames to reports/<assessment_id>/users_rid.txt.
-    Returns the absolute path.
-    """
+    """Write users to reports/<assessment_id>/users_rid.txt. Returns abs path."""
     dirpath  = _assessment_report_dir(assessment_id)
     filepath = os.path.join(dirpath, "users_rid.txt")
     clean    = [u.strip() for u in users if u.strip()]
+    with open(filepath, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(clean) + ("\n" if clean else ""))
+    return filepath
+
+
+def _write_groups_file(assessment_id: str, groups: list[str]) -> str:
+    """Write groups to reports/<assessment_id>/groups_rid.txt. Returns abs path."""
+    dirpath  = _assessment_report_dir(assessment_id)
+    filepath = os.path.join(dirpath, "groups_rid.txt")
+    clean    = [g.strip() for g in groups if g.strip()]
     with open(filepath, "w", encoding="utf-8") as fh:
         fh.write("\n".join(clean) + ("\n" if clean else ""))
     return filepath
@@ -432,11 +445,14 @@ class SMBEnumerationModule:
             if rid_users:
                 users_file = _write_users_file(assessment_id, rid_users)
                 _info(f"Users  → {users_file}")
+            if rid_groups:
+                grp_file = _write_groups_file(assessment_id, rid_groups)
+                _info(f"Groups → {grp_file}")
+            if rid_users or rid_groups:
                 _write_generated(rid_users, rid_groups)
-                _info("Users synced → generated/users-all.txt")
-            else:
-                raw_combined = "\n".join(raw_log_parts)
-                _info("No users to save — users_rid.txt skipped")
+                _info("Synced → generated/users-all.txt")
+            if not rid_users:
+                _info("No users found — users_rid.txt skipped")
         except Exception as exc:
             raw_log_parts.append(f"## Step 5 ERROR: {exc}")
             _info(f"Artifact write failed: {exc}")
