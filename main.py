@@ -60,8 +60,10 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         _display_ldap_results(result)
 
     elif key == "smb_enum":
-        from modules.smb_enum_module import run as smb_run
-        smb_run(state)
+        from modules.smb_enum_module import run as smb_run, display_results as smb_display
+        result = smb_run(state)
+        smb_display(result)
+        save_session(state)
 
     elif key == "smbrelay":
         console.print("\n  [yellow]⚠  SMB Relay module not yet implemented.[/yellow]\n")
