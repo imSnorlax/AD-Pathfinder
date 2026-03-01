@@ -576,28 +576,65 @@ class SMBEnumerationModule:
         self, target: str, raw_log: list[str]
     ) -> tuple[list[str], list[str]]:
         """
-        Step 3 — RID brute-force. Tries null session first then guest.
-        Runs silently — raw output logged to smb_raw.txt, not printed.
-        Returns (users, groups).
+        Step 3 — RID brute-force.
+
+        WHY --log file approach:
+        nxc uses Rich live display that writes directly to the terminal,
+        bypassing stdout when not connected to a TTY. subprocess.PIPE captures
+        stdout/stderr but nxc's actual enumeration output never arrives there.
+        Using --log <tmpfile> forces nxc to write plain text to a file
+        regardless of TTY state — guaranteed capture.
+
+        Tries guest first (matches working playbook), then null session fallback.
         """
+        import tempfile
+
         cme = self._find_cme()
         if not cme:
+            raw_log.append("## Step 3: no nxc/crackmapexec binary found")
             return [], []
 
         for user, label in [("guest", "guest"), ("", "null session")]:
+            # Write to a temp log file — nxc plain-text output is always there
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", prefix="adpf_rid_",
+                delete=False
+            ) as tmp:
+                log_path = tmp.name
+
+            cmd = [
+                cme, "smb", target,
+                "-u", user, "-p", "",
+                "--rid-brute",
+                "--log", log_path,
+            ]
             raw_log.append(
                 f"## Step 3 ({label}): {cme} smb {target} "
-                f"-u '{user}' -p '' --rid-brute"
+                f"-u '{user}' -p '' --rid-brute --log {log_path}"
             )
-            result   = self._quiet_exec.run(
-                [cme, "smb", target, "-u", user, "-p", "", "--rid-brute"],
-                ok_exit_codes=(0, 1),
-            )
-            combined = result["output"] + result["error"]
-            raw_log.append(combined)
 
-            if "[+]" in combined or "SidType" in combined:
-                users, groups = parse_rid_output(combined)
+            try:
+                self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
+            except Exception as exc:
+                raw_log.append(f"## Step 3 ({label}) run error: {exc}")
+
+            # Read the log file — nxc always writes here
+            file_output = ""
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    file_output = fh.read()
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.unlink(log_path)
+                except OSError:
+                    pass
+
+            raw_log.append(f"## Step 3 ({label}) log output:\n{file_output}")
+
+            if file_output.strip():
+                users, groups = parse_rid_output(file_output)
                 if users or groups:
                     return users, groups
 
