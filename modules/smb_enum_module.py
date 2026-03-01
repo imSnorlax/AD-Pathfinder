@@ -235,6 +235,34 @@ def _parse_crackmapexec_output(output: str) -> tuple[Optional[bool], str]:
 # nxc share output parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_smbmap_shares(output: str) -> list[str]:
+    """
+    Parse share names from smbmap --no-banner output.
+
+    smbmap line format:
+        \\tADMIN$                  NO ACCESS       Remote Admin
+        \\tCommon                  READ, WRITE
+    The share name is the first whitespace token on each indented share line.
+    """
+    shares: list[str] = []
+    seen: set[str] = set()
+    skip_words = {"Disk", "----", "Share", "Permissions", "Comment", "Remark"}
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("[") or stripped.startswith("-"):
+            continue
+        parts = stripped.split()
+        if not parts:
+            continue
+        name = parts[0]
+        if name in skip_words or name.startswith("-"):
+            continue
+        if name not in seen:
+            shares.append(name)
+            seen.add(name)
+    return shares
+
+
 def _parse_nxc_shares(output: str) -> list[str]:
     """
     Parse share names from nxc/crackmapexec --shares output.
