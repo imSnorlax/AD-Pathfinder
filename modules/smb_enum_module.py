@@ -415,12 +415,12 @@ class SMBEnumerationModule:
             _info(f"Share enumeration failed: {exc}")
 
         # ── STEP 3: RID Brute-Force ───────────────────────────────────────────
-        _step_banner(3, "RID brute-force  (null → guest)")
+        _step_banner(3, "RID brute-force")
         try:
-            rid_users, rid_groups = self._step_rid_brute(target, raw_log_parts)
+            rid_users, rid_groups = self._step_rid_brute(target, creds, raw_log_parts, _info)
             _info(
                 f"Users: {len(rid_users)}  |  Groups: {len(rid_groups)}"
-                + (f"  →  preview: {', '.join(rid_users[:5])}" if rid_users else "")
+                + (f"  \u2192  preview: {', '.join(rid_users[:5])}" if rid_users else "")
             )
         except Exception as exc:
             raw_log_parts.append(f"## Step 3 ERROR: {exc}")
@@ -573,44 +573,40 @@ class SMBEnumerationModule:
         return _parse_signing(combined)
 
     def _step_rid_brute(
-        self, target: str, raw_log: list[str]
+        self, target: str, creds, raw_log: list[str], _info=None
     ) -> tuple[list[str], list[str]]:
         """
         Step 3 — RID brute-force via PTY.
 
-        WHY PTY:
-        nxc calls sys.stdout.isatty() and only writes its Rich enumeration
-        output when connected to a real terminal. subprocess.PIPE is detected
-        as non-TTY so output is suppressed. pty.openpty() creates a real
-        pseudo-terminal that fools nxc into producing its normal output.
-
-        Tries guest first (user's working command), then null session fallback.
+        Uses provided credentials if available, otherwise guest.
+        No null session attempt ("-u '' -p ''" is unreliable in nxc).
+        If nxc produces output but no SidType objects are found, displays a
+        clear diagnostic message instead of silently returning empty lists.
         """
         import pty
         import select
         import re as _re
         import subprocess as _sp
+        import time
 
-        # Strip ANSI escape codes from captured PTY output
+        def _warn(msg: str) -> None:
+            if _info:
+                _info(msg)
+
         _ansi = _re.compile(r"\x1b\[[0-9;]*[mGKHF]|\x1b\[?[0-9;]*[a-zA-Z]|\r")
 
         def _run_pty(cmd: list[str], timeout: int = 120) -> str:
-            """Run cmd through a PTY and return full captured output as str."""
             master_fd, slave_fd = pty.openpty()
             chunks: list[bytes] = []
             try:
                 proc = _sp.Popen(
-                    cmd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    stdin=slave_fd,
-                    close_fds=True,
+                    cmd, stdout=slave_fd, stderr=slave_fd,
+                    stdin=slave_fd, close_fds=True,
                 )
                 os.close(slave_fd)
-                import time
                 deadline = time.time() + timeout
                 while True:
-                    remaining = max(0, deadline - time.time())
+                    remaining = max(0.0, deadline - time.time())
                     if remaining == 0:
                         proc.kill()
                         break
@@ -625,15 +621,14 @@ class SMBEnumerationModule:
                         except OSError:
                             break
                     if proc.poll() is not None:
-                        # Drain any remaining output
                         try:
                             while True:
-                                ready, _, _ = select.select([master_fd], [], [], 0.2)
-                                if not ready:
+                                r, _, _ = select.select([master_fd], [], [], 0.2)
+                                if not r:
                                     break
-                                data = os.read(master_fd, 4096)
-                                if data:
-                                    chunks.append(data)
+                                d = os.read(master_fd, 4096)
+                                if d:
+                                    chunks.append(d)
                                 else:
                                     break
                         except OSError:
@@ -645,39 +640,62 @@ class SMBEnumerationModule:
                     os.close(master_fd)
                 except OSError:
                     pass
-            raw_bytes = b"".join(chunks)
-            raw_str = raw_bytes.decode("utf-8", errors="replace")
-            return _ansi.sub("", raw_str)
+            return _ansi.sub("", b"".join(chunks).decode("utf-8", errors="replace"))
 
         cme = self._find_cme()
         if not cme:
             raw_log.append("## Step 3: no nxc/crackmapexec binary found")
+            _warn("nxc/crackmapexec not found in PATH")
             return [], []
 
-        for user, label in [("guest", "guest"), ("", "null session")]:
-            cmd = [cme, "smb", target, "-u", user, "-p", "", "--rid-brute"]
-            raw_log.append(
-                f"## Step 3 ({label}): {' '.join(cmd)}"
-            )
-            output = ""
+        # Choose credentials: use provided if available, else guest
+        if creds and creds.username and (creds.password or creds.ntlm_hash):
+            auth_u = creds.username
+            auth_p = creds.password
+            auth_h = creds.ntlm_hash
+            label  = f"as {auth_u}"
+        else:
+            auth_u = "guest"
+            auth_p = ""
+            auth_h = ""
+            label  = "guest"
+
+        cmd = [cme, "smb", target, "-u", auth_u]
+        if auth_h:
+            cmd += ["-H", auth_h]
+        else:
+            cmd += ["-p", auth_p]
+        cmd += ["--rid-brute"]
+
+        raw_log.append(f"## Step 3 ({label}): {' '.join(cmd)}")
+
+        output = ""
+        try:
+            output = _run_pty(cmd, timeout=120)
+        except Exception as exc:
+            raw_log.append(f"## Step 3 PTY error: {exc} — falling back to PIPE")
             try:
-                output = _run_pty(cmd, timeout=120)
-            except Exception as exc:
-                raw_log.append(f"## Step 3 ({label}) PTY error: {exc} — falling back to PIPE")
-                try:
-                    result = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
-                    output = result["output"] + result["error"]
-                except Exception as exc2:
-                    raw_log.append(f"## Step 3 ({label}) PIPE fallback error: {exc2}")
+                res = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
+                output = res["output"] + res["error"]
+            except Exception as exc2:
+                raw_log.append(f"## Step 3 PIPE fallback error: {exc2}")
 
-            raw_log.append(f"## Step 3 ({label}) output:\n{output[:2000]}")
+        raw_log.append(f"## Step 3 output (first 2000 chars):\n{output[:2000]}")
 
-            if output.strip():
-                users, groups = parse_rid_output(output)
-                if users or groups:
-                    return users, groups
+        if not output.strip():
+            _warn("RID brute returned no output — target may be unreachable")
+            return [], []
 
-        return [], []
+        users, groups = parse_rid_output(output)
+
+        if not users and not groups:
+            _warn(
+                "RID brute returned no objects — "
+                "likely restricted or requires authentication"
+            )
+
+        return users, groups
+
 
     def _step_ipc(
         self, target: str, raw_log: list[str]
