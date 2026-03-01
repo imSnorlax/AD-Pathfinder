@@ -141,6 +141,7 @@ class CommandExecutor:
         timeout: Optional[int] = None,
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
+        ok_exit_codes: tuple[int, ...] = (0,),
     ) -> CommandResult:
         """
         Execute a command and return a structured result dict.
@@ -157,6 +158,11 @@ class CommandExecutor:
         env : dict | None
             Environment variables for the subprocess.
             None inherits the parent process environment.
+        ok_exit_codes : tuple[int, ...]
+            Exit codes considered successful.  Defaults to (0,).
+            Add extra codes for tools that use non-zero exits to signal
+            'not found / no results' rather than a real error, e.g.
+            smbclient uses exit code 1 on access-denied null sessions.
 
         Returns
         -------
@@ -191,7 +197,7 @@ class CommandExecutor:
             )
 
             result: CommandResult = {
-                "status":    "success" if proc.returncode == 0 else "error",
+                "status":    "success" if proc.returncode in ok_exit_codes else "error",
                 "command":   command,
                 "output":    proc.stdout.decode("utf-8", errors="replace").strip(),
                 "error":     proc.stderr.decode("utf-8", errors="replace").strip(),

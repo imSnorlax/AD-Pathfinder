@@ -541,12 +541,15 @@ class SMBEnumerationModule:
         if _RICH_AVAILABLE:
             console.print("  [dim]→ Testing null session...[/dim]")
 
-        result = self.executor.run([
-            "smbclient",
-            f"//{target}/",
-            "-N",           # no password
-            "-L",           # list shares
-        ])
+        result = self.executor.run(
+            [
+                "smbclient",
+                f"//{target}/",
+                "-N",           # no password
+                "-L",           # list shares
+            ],
+            ok_exit_codes=(0, 1),  # exit 1 = access denied (expected, not a crash)
+        )
 
         return _parse_smbclient_output(result["output"], result["error"])
 
