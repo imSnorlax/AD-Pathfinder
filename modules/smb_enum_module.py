@@ -306,6 +306,9 @@ def _parse_rid_brute_output(output: str) -> tuple[list[str], list[str]]:
     We extract the name after the last backslash and before the '(' marker,
     mirroring the user's playbook pipeline:
         cut -d '\\' -f2 | cut -d '(' -f1 | sed 's/ *$//'
+
+    Machine accounts (ending in '$') are excluded from the user list —
+    they are not useful for password spraying or AS-REP roasting.
     """
     users:  list[str] = []
     groups: list[str] = []
@@ -326,6 +329,9 @@ def _parse_rid_brute_output(output: str) -> tuple[list[str], list[str]]:
         seen.add(name)
 
         if sid_type == "user":
+            # Skip machine accounts (computer objects end with $)
+            if name.endswith("$"):
+                continue
             users.append(name)
         else:          # group / alias
             groups.append(name)
@@ -475,18 +481,26 @@ class SMBEnumerationModule:
         rid_users, rid_groups = self._rid_brute_check(target)
 
         if rid_users:
-            if _RICH_AVAILABLE:
-                console.print(
-                    f"  [dim]→ RID brute force: {len(rid_users)} users, "
-                    f"{len(rid_groups)} groups discovered.[/dim]"
-                )
-            # Save to generated/ for use by attack modules (exact playbook filenames)
+            # Save to generated/ — clean usernames, one per line
             from modules.file_export import save_rid_users, save_rid_groups
             users_path  = save_rid_users(rid_users)
             groups_path = save_rid_groups(rid_groups)
             if _RICH_AVAILABLE:
-                console.print(f"  [dim]→ Written: {users_path}[/dim]")
-                console.print(f"  [dim]→ Written: {groups_path}[/dim]")
+                preview = ", ".join(rid_users[:10])
+                if len(rid_users) > 10:
+                    preview += f" ... (+{len(rid_users)-10} more)"
+                from modules.file_export import save_rid_users as _s
+                console.print(
+                    Panel(
+                        f"[bold green]✔  {len(rid_users)} users → {users_path}[/bold green]\n"
+                        f"[bold green]✔  {len(rid_groups)} groups → {groups_path}[/bold green]\n"
+                        f"[bold green]✔  Merged into generated/users-all.txt[/bold green]\n\n"
+                        f"[dim]{preview}[/dim]",
+                        title="[bold bright_cyan]RID Brute-Force — Files Written[/bold bright_cyan]",
+                        border_style="bright_blue",
+                    )
+                )
+
 
         # ── Compile findings ───────────────────────────────────────────
         findings = {
