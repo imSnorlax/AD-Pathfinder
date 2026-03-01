@@ -327,26 +327,62 @@ class LDAPEnumerationModule:
                 "Anonymous bind was denied; falling back to authenticated queries."
             )
         else:
-            warnings.append(
-                "Anonymous bind denied, guest login failed, and no credentials stored. "
-                "Re-run after adding credentials via 'Start New Assessment' or supply "
-                "valid creds to the session."
-            )
-            return {
-                "status":        "error",
-                "anonymous":     False,
-                "ldaps":         use_ldaps,
-                "users":         [],
-                "asrep_users":   [],
-                "groups":        [],
-                "spns":          [],
-                "desc_findings": [],
-                "error": (
-                    "LDAP bind failed: anonymous denied, guest rejected, "
-                    "no credentials available."
-                ),
-                "warnings":      warnings,
-            }
+            # ── Interactive credential prompt ──────────────────────────────
+            # Anonymous + guest both failed. Ask the operator for credentials
+            # right now instead of bailing. This supports:
+            #   "ldapsearch ... shandeigh.brana:*9jh}:k" style recon
+            try:
+                from rich.prompt import Prompt
+                from rich.console import Console as _Con
+                _con = _Con()
+                _con.print(
+                    "\n  [bold yellow]Anonymous and guest LDAP binds denied.[/bold yellow]\n"
+                    "  [dim]Enter credentials to enumerate as an authenticated user.[/dim]\n"
+                    "  [dim](Leave username blank to cancel.)[/dim]"
+                )
+                _user = Prompt.ask("  [bold bright_cyan]Username[/bold bright_cyan]")
+                if not _user.strip():
+                    return {
+                        "status":        "error",
+                        "anonymous":     False,
+                        "ldaps":         use_ldaps,
+                        "users":         [],
+                        "asrep_users":   [],
+                        "groups":        [],
+                        "spns":          [],
+                        "desc_findings": [],
+                        "error":         "LDAP cancelled — no credentials provided.",
+                        "warnings":      warnings,
+                    }
+                _pass = Prompt.ask(
+                    "  [bold bright_cyan]Password[/bold bright_cyan]",
+                    password=True,
+                )
+                from session import Credentials as _Creds
+                bind_creds = _Creds(username=_user.strip(), password=_pass)
+                bind_label = _user.strip()
+                # Persist in state so other modules can reuse them
+                state.initial_credentials = bind_creds
+                warnings.append(
+                    f"Using interactively-entered credentials: {bind_label}"
+                )
+            except Exception:
+                return {
+                    "status":        "error",
+                    "anonymous":     False,
+                    "ldaps":         use_ldaps,
+                    "users":         [],
+                    "asrep_users":   [],
+                    "groups":        [],
+                    "spns":          [],
+                    "desc_findings": [],
+                    "error": (
+                        "LDAP bind failed: anonymous denied, guest rejected, "
+                        "no credentials available."
+                    ),
+                    "warnings":      warnings,
+                }
+
 
         user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=bind_creds)
         group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds)

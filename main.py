@@ -314,16 +314,23 @@ def _display_ldap_results(result: dict) -> None:
     # ── Suspicious descriptions detail ────────────────────────────
     if desc:
         desc_table = Table(
-            title="[bold red]⚠  Suspicious Description Fields[/bold red]",
-            box=box.SIMPLE,
+            title="[bold red]⚠  Credentials Found in Description Fields[/bold red]",
+            box=box.ROUNDED,
             border_style="red",
             show_lines=True,
         )
         desc_table.add_column("Username",    style="bold yellow", width=22)
-        desc_table.add_column("Description", style="white")
+        desc_table.add_column("Description", style="bold red")
         for f in desc:
             desc_table.add_row(f["username"], f["description"])
+        console.print()
         console.print(desc_table)
+        console.print()
+        console.print("  [bold red]⚠  IMPORTANT — Temporary Password Workflow:[/bold red]")
+        console.print("  [dim]These creds may be temporary (must-change-at-next-logon).[/dim]")
+        console.print("  [dim]Test  →  Phase 2 → Credential Validation → netexec smb -u <user> -p <pass> --users[/dim]")
+        console.print("  [dim]Reset →  Phase 2 → Credential Validation → smbpasswd -r <dc> -U <user>[/dim]")
+        console.print()
 
     # ── SPN list ──────────────────────────────────────────────
     spns = result["spns"]
@@ -340,9 +347,28 @@ def _display_ldap_results(result: dict) -> None:
             spn_table.add_row(s["username"], s["spn"])
         console.print(spn_table)
 
+    # ── Password policy ───────────────────────────────────────
+    policy = result.get("password_policy")
+    if policy:
+        pol_table = Table(
+            title="[bold bright_cyan]Password Policy[/bold bright_cyan]",
+            box=box.SIMPLE, border_style="bright_blue", show_lines=True,
+        )
+        pol_table.add_column("Setting", style="bold bright_cyan", width=28)
+        pol_table.add_column("Value",   style="white")
+        for k, v in policy.items():
+            pol_table.add_row(k, str(v))
+        console.print(pol_table)
+        console.print("  [dim]→ Know the lockout threshold before password spraying.[/dim]")
+
     # ── Warnings ──────────────────────────────────────────────
     for w in result.get("warnings", []):
         console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+
+    # ── domain dump ───────────────────────────────────────────
+    dump = result.get("domain_dump_path")
+    if dump:
+        console.print(f"\n  [green]✔  ldapdomaindump saved to:[/green] [dim]{dump}[/dim]")
 
     console.print()
 
