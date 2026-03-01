@@ -28,6 +28,7 @@ try:
     from rich.text import Text
     from rich import box
     from rich.table import Table
+    from rich.markup import escape as _escape
     _RICH_AVAILABLE = True
     console = Console()
 except ImportError:
@@ -55,7 +56,8 @@ def _print_rich(result: CommandResult) -> None:
     status_color = "bold green" if result["status"] == "success" else "bold red"
     status_icon  = "✔" if result["status"] == "success" else "✘"
 
-    cmd_str = " ".join(result["command"])
+    # Escape command and output — they may contain [ ] chars (e.g. nxc [+] lines)
+    cmd_str = _escape(" ".join(result["command"]))
 
     table = Table(box=box.ROUNDED, show_header=False, border_style="bright_blue", expand=False)
     table.add_column("Key",   style="bold bright_cyan", width=12)
@@ -67,12 +69,12 @@ def _print_rich(result: CommandResult) -> None:
     table.add_row("Timestamp", result["timestamp"])
 
     if result["output"]:
-        output_preview = result["output"][:300] + ("…" if len(result["output"]) > 300 else "")
-        table.add_row("Output",   f"[dim]{output_preview}[/dim]")
+        raw = result["output"][:300] + ("…" if len(result["output"]) > 300 else "")
+        table.add_row("Output", f"[dim]{_escape(raw)}[/dim]")
 
     if result["error"]:
-        error_preview = result["error"][:300] + ("…" if len(result["error"]) > 300 else "")
-        table.add_row("Stderr",   f"[yellow]{error_preview}[/yellow]")
+        raw = result["error"][:300] + ("…" if len(result["error"]) > 300 else "")
+        table.add_row("Stderr", f"[yellow]{_escape(raw)}[/yellow]")
 
     console.print(
         Panel(
