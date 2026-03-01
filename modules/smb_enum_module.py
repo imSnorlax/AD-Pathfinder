@@ -64,10 +64,12 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
         table.add_column("Property", style="bold bright_cyan", width=22)
         table.add_column("Value",    style="white")
 
-        anon     = findings.get("anonymous_access", False)
-        signing  = findings.get("smb_signing",      None)
-        version  = findings.get("smb_version",      "Unknown")
-        shares   = findings.get("shares",            [])
+        anon      = findings.get("anonymous_access", False)
+        signing   = findings.get("smb_signing",      None)
+        version   = findings.get("smb_version",      "Unknown")
+        shares    = findings.get("shares",            [])
+        rid_users = findings.get("rid_users",         [])
+        rid_grps  = findings.get("rid_groups",        [])
 
         table.add_row(
             "Anonymous Access",
@@ -75,15 +77,15 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
         )
 
         if signing is None:
-            signing_display = "[dim]Unknown (crackmapexec not available)[/dim]"
+            signing_display = "[dim]Unknown (nxc not available)[/dim]"
         elif signing:
             signing_display = "[green]Enabled[/green]"
         else:
             signing_display = "[bold red]DISABLED — Relay possible[/bold red]"
 
-        table.add_row("SMB Signing",     signing_display)
-        table.add_row("SMB Version",     version)
-        table.add_row("Shares Found",    str(len(shares)))
+        table.add_row("SMB Signing",  signing_display)
+        table.add_row("SMB Version",  version)
+        table.add_row("Shares Found", str(len(shares)))
 
         if shares:
             table.add_row(
@@ -94,6 +96,21 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
                     else s
                     for s in shares
                 ),
+            )
+
+        # ── RID brute results ───────────────────────────────────────────
+        if rid_users:
+            table.add_row(
+                "RID Users Found",
+                f"[bold green]{len(rid_users)}[/bold green] → saved to [dim]generated/users-rid.txt[/dim]",
+            )
+            # Show first 8 users inline
+            preview = ", ".join(rid_users[:8]) + (f" … (+{len(rid_users)-8} more)" if len(rid_users) > 8 else "")
+            table.add_row("Users (preview)", f"[dim]{preview}[/dim]")
+        if rid_grps:
+            table.add_row(
+                "RID Groups Found",
+                f"[bold green]{len(rid_grps)}[/bold green] → saved to [dim]generated/groups-rid.txt[/dim]",
             )
 
         console.print(table)
@@ -116,6 +133,9 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
         print(f"  SMB Signing      : {findings.get('smb_signing')}")
         print(f"  SMB Version      : {findings.get('smb_version', 'Unknown')}")
         print(f"  Shares           : {', '.join(findings.get('shares', []))}")
+        ru = findings.get('rid_users', [])
+        if ru:
+            print(f"  RID Users ({len(ru)}): {', '.join(ru[:10])}")
         if suggestions:
             print("\n--- Suggested Next Actions ---")
             for s in suggestions:
@@ -630,19 +650,35 @@ class SMBEnumerationModule:
 
     def _nxc_guest_share_check(self, target: str) -> list[str]:
         """
-        Attempt share enumeration using nxc/crackmapexec with guest credentials
-        (user='guest', password='').
+        Enumerate shares as guest using smbmap (primary) or nxc (fallback).
 
-        This succeeds on many DCs that block true null sessions but leave the
-        built-in Guest account enabled — the exact scenario where smbclient -N
-        returns access denied but ``nxc smb target -u guest -p '' --shares``
-        works.
+        WHY smbmap first:
+        nxc uses a rich live display for --shares output that bypasses stdout
+        when not connected to a TTY, resulting in empty captured output.
+        smbmap always writes plain text to stdout, making it safe for subprocess.
 
         Returns
         -------
         list[str]
             Share names discovered, or an empty list if unavailable/denied.
         """
+        # ── Try smbmap first ────────────────────────────────────────────
+        if self.executor.check_tool("smbmap"):
+            if _RICH_AVAILABLE:
+                console.print("  [dim]→ Guest share enum via smbmap...[/dim]")
+            result = self.executor.run(
+                ["smbmap", "-H", target, "-u", "guest", "-p", "", "--no-banner"],
+                ok_exit_codes=(0, 1),
+            )
+            combined = result["output"] + result["error"]
+            if "[+]" in combined or "READ" in combined or "WRITE" in combined or "NO ACCESS" in combined:
+                shares = _parse_smbmap_shares(combined)
+                if shares:
+                    if _RICH_AVAILABLE:
+                        console.print(f"  [dim]→ smbmap: {len(shares)} share(s) found.[/dim]")
+                    return shares
+
+        # ── Fallback: nxc --shares ──────────────────────────────────────
         cme_bin = None
         for binary in ("nxc", "crackmapexec", "cme"):
             if self.executor.check_tool(binary):
@@ -653,9 +689,7 @@ class SMBEnumerationModule:
             return []
 
         if _RICH_AVAILABLE:
-            console.print(
-                f"  [dim]→ Trying guest share enumeration via {cme_bin}...[/dim]"
-            )
+            console.print(f"  [dim]→ Trying guest share enumeration via {cme_bin}...[/dim]")
 
         command = [
             cme_bin, "smb", target,
@@ -667,7 +701,6 @@ class SMBEnumerationModule:
         result = self.executor.run(command)
         combined = result["output"] + result["error"]
 
-        # A successful guest auth shows [+] in the output
         if "[+]" not in combined and result["exit_code"] != 0:
             return []
 
