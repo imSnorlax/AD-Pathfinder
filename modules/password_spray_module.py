@@ -91,12 +91,9 @@ def _parse_spray_output(output: str) -> tuple[list[dict], bool]:
 
 
 def _save_user_file(users: list[str], assessment_id: str) -> str:
-    """Save users to reports/<assessment_id>-users.txt for operator use."""
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    path = os.path.join(REPORTS_DIR, f"{assessment_id}-users.txt")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(users) + "\n")
-    return os.path.abspath(path)
+    """Save users to generated/users-all.txt for operator use."""
+    from modules.file_export import save_all_users
+    return save_all_users(users)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,9 +160,14 @@ class PasswordSprayModule:
             return self._error("nxc/crackmapexec not found. Run: sudo apt install netexec")
 
         if not state.users:
-            return self._error(
-                "No user list in state. Run SMB RID brute force or LDAP enumeration first."
-            )
+            # Try loading from disk — generated/ might have users from a previous run
+            from modules.file_export import load_users_into_state
+            loaded = load_users_into_state(state)
+            if not loaded:
+                return self._error(
+                    "No user list available. Run SMB RID brute force or LDAP enumeration first "
+                    "(generates generated/users-all.txt automatically)."
+                )
 
         if not passwords:
             return self._error("No passwords provided. Supply at least one password to spray.")

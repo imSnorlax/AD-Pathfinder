@@ -170,10 +170,29 @@ class ASREPRoastingModule:
                 "Run LDAP enumeration first to narrow this list."
             )
         else:
-            return self._error(
-                "No user list available. Run SMB RID brute force or LDAP "
-                "enumeration first to populate state.users."
-            )
+            # Fallback: try loading from generated/ files on disk
+            from modules.file_export import load_asrep_targets, load_users_all
+            disk_asrep = load_asrep_targets()
+            disk_users = load_users_all()
+            if disk_asrep:
+                mode      = "targeted"
+                user_pool = disk_asrep
+                state.asrep_users = disk_asrep
+                warnings.append(
+                    f"Loaded {len(disk_asrep)} AS-REP targets from generated/users-asrep.txt."
+                )
+            elif disk_users:
+                mode      = "broad"
+                user_pool = disk_users
+                state.users = disk_users
+                warnings.append(
+                    f"Loaded {len(disk_users)} users from generated/users-all.txt."
+                )
+            else:
+                return self._error(
+                    "No user list available. Run SMB RID brute force or LDAP enumeration first. "
+                    "(Generates generated/users-all.txt automatically.)"
+                )
 
         # ── Write temp user list ────────────────────────────────────────
         tmp_path = os.path.join(

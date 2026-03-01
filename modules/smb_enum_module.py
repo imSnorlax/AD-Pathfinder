@@ -432,12 +432,13 @@ class SMBEnumerationModule:
                     f"  [dim]→ RID brute force: {len(rid_users)} users, "
                     f"{len(rid_groups)} groups discovered.[/dim]"
                 )
-            # Save to reports/ for use by attack modules
-            os.makedirs("reports", exist_ok=True)
-            users_path  = os.path.join("reports", f"{state.assessment_id}-users-rid.txt")
-            groups_path = os.path.join("reports", f"{state.assessment_id}-groups-rid.txt")
-            with open(users_path,  "w") as f: f.write("\n".join(rid_users)  + "\n")
-            with open(groups_path, "w") as f: f.write("\n".join(rid_groups) + "\n")
+            # Save to generated/ for use by attack modules (exact playbook filenames)
+            from modules.file_export import save_rid_users, save_rid_groups
+            users_path  = save_rid_users(rid_users)
+            groups_path = save_rid_groups(rid_groups)
+            if _RICH_AVAILABLE:
+                console.print(f"  [dim]→ Written: {users_path}[/dim]")
+                console.print(f"  [dim]→ Written: {groups_path}[/dim]")
 
         # ── Compile findings ───────────────────────────────────────────
         findings = {

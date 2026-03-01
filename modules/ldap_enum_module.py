@@ -424,10 +424,20 @@ class LDAPEnumerationModule:
         new_users = [u for u in users if u not in existing_users]
         state.users.extend(new_users)
 
+        # Export user list to generated/
+        if state.users:
+            from modules.file_export import save_ldap_users
+            save_ldap_users(state.users)
+
         # ── AS-REP roastable accounts ──────────────────────────────────
         existing_asrep = set(state.asrep_users)
         new_asrep = [u for u in asrep_users if u not in existing_asrep]
         state.asrep_users.extend(new_asrep)
+
+        # Export AS-REP targets to generated/
+        if state.asrep_users:
+            from modules.file_export import save_asrep_targets
+            save_asrep_targets(state.asrep_users)
 
         if new_asrep:
             state.log_finding(
@@ -451,6 +461,11 @@ class LDAPEnumerationModule:
             if (s["username"], s["spn"]) not in existing_spns
         ]
         state.spns.extend(new_spns)
+
+        # Export SPNs to generated/
+        if state.spns:
+            from modules.file_export import save_spns
+            save_spns(state.spns)
 
         if new_spns:
             spn_summary = ", ".join(
