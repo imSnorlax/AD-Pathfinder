@@ -45,12 +45,26 @@ class AssessmentState:
     vulnerabilities: list[dict] = field(default_factory=list)
 
     # Extracted hashes — populated by AS-REP Roasting + Kerberoasting modules.
-    # Each entry: {"type": "asrep"|"tgs", "username": str, "hash": str, "spn": str (tgs only)}
+    # Each entry: {"type": "asrep"|"tgs"|"netntlmv2", "username": str, "hash": str, "spn": str (tgs only)}
     hashes: list[dict] = field(default_factory=list)
+
+    # NTLM hashes from DCSync — populated by dcsync_module.
+    # Each entry: {"username": str, "rid": str, "lm": str, "nt": str}
+    ntlm_hashes: list[dict] = field(default_factory=list)
 
     # Cracked passwords — populated when hash is cracked.
     # Each entry: {"username": str, "password": str, "source": str}
     cracked_passwords: list[dict] = field(default_factory=list)
+
+    # Password policy — populated by ldap_enum_module password policy query.
+    # Keys: minPwdLength, lockoutThreshold, pwdHistoryLength, etc.
+    password_policy: dict = field(default_factory=dict)
+
+    # Path to ldapdomaindump output folder (populated by ldap_enum_module).
+    domain_dump_path: str = ""
+
+    # Path to forged Golden Ticket .ccache file (populated by golden_ticket_module).
+    golden_ticket_path: str = ""
 
     # Audit trail
     performed_actions: list[str] = field(default_factory=list)

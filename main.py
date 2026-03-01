@@ -67,7 +67,44 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
         console.print("\n  [yellow]⚠  SMB Relay module not yet implemented.[/yellow]\n")
 
     elif key == "winrm":
-        console.print("\n  [yellow]⚠  WinRM module not yet implemented.[/yellow]\n")
+        from modules.evil_winrm_module import run as winrm_run
+        winrm_run(state)
+        save_session(state)
+
+    elif key == "passthehash":
+        from modules.evil_winrm_module import run as winrm_run
+        winrm_run(state)
+        save_session(state)
+
+    elif key == "responder":
+        from modules.responder_module import run as responder_run
+        result = responder_run(state)
+        _display_responder_results(result)
+        save_session(state)
+
+    elif key == "credvalidation":
+        from modules.cred_validation_module import run as cred_run
+        result = cred_run(state)
+        _display_cred_validation_results(result)
+        save_session(state)
+
+    elif key == "aclabuse":
+        from modules.acl_abuse_module import run as acl_run
+        result = acl_run(state)
+        _display_acl_results(result)
+        save_session(state)
+
+    elif key == "dcsync":
+        from modules.dcsync_module import run as dcsync_run
+        result = dcsync_run(state)
+        _display_dcsync_results(result)
+        save_session(state)
+
+    elif key == "goldenticket":
+        from modules.golden_ticket_module import run as gt_run
+        result = gt_run(state)
+        _display_golden_ticket_results(result)
+        save_session(state)
 
     elif key == "spraying":
         from modules.password_spray_module import run as spray_run
@@ -418,6 +455,143 @@ def _display_spray_results(result: dict) -> None:
     console.print()
 
 
+def _display_responder_results(result: dict) -> None:
+    """Display Responder LLMNR/NBT-NS poisoning results."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  Responder failed:[/bold red] {result['error']}\n")
+        return
+
+    hashes = result["hashes"]
+    table  = Table(
+        title="[bold bright_cyan]Responder — LLMNR Poisoning Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=22)
+    table.add_column("Value",    style="white")
+    table.add_row("Hashes Captured", f"[bold red]{len(hashes)}[/bold red]" if hashes else "[green]None[/green]")
+    table.add_row("Saved to", result["hash_file"] or "N/A")
+    console.print(); console.print(table)
+
+    if hashes:
+        console.print(f"\n  [bold yellow]Crack command (NetNTLMv2 — mode 5600):[/bold yellow]")
+        console.print(f"  [dim]{result['crack_command']}[/dim]\n")
+        for h in hashes[:3]:
+            console.print(f"  [dim]{h[:80]}…[/dim]")
+        if len(hashes) > 3:
+            console.print(f"  [dim]… and {len(hashes)-3} more[/dim]")
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_cred_validation_results(result: dict) -> None:
+    """Display credential validation and password reset results."""
+    if result["status"] == "error" and result["operation"] != "cancelled":
+        console.print(f"\n  [bold red]✘  Credential Validation error:[/bold red] {result['error']}\n")
+        return
+
+    valid = result.get("valid_creds", [])
+    table = Table(
+        title="[bold bright_cyan]Credential Validation Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=22)
+    table.add_column("Value",    style="white")
+    table.add_row("Valid Credentials", f"[bold red]{len(valid)} confirmed[/bold red]" if valid else "[green]None[/green]")
+    table.add_row("Password Reset",    "[green]Done[/green]" if result.get("reset_done") else "[dim]No[/dim]")
+    console.print(); console.print(table)
+
+    if valid:
+        ct = Table(box=box.SIMPLE, border_style="red", show_lines=True)
+        ct.add_column("Username", style="bold yellow", width=22)
+        ct.add_column("Password", style="bold red")
+        for c in valid:
+            ct.add_row(c["username"], c["password"])
+        console.print(ct)
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_acl_results(result: dict) -> None:
+    """Display ACL/WriteDACL abuse results."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  ACL Abuse failed:[/bold red] {result['error']}\n")
+        return
+
+    console.print()
+    console.print(
+        f"  [bold green]✔  WriteDACL success:[/bold green] "
+        f"'{result['member']}' added to group '[bold red]{result['group']}[/bold red]'"
+    )
+    console.print(f"  [dim]Auth:    {result['auth_user']}[/dim]")
+    console.print(f"  [dim]Command: {result['command']}[/dim]")
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_dcsync_results(result: dict) -> None:
+    """Display DCSync (secretsdump) results."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  DCSync failed:[/bold red] {result['error']}\n")
+        return
+
+    hashes = result["hashes"]
+    table  = Table(
+        title="[bold bright_cyan]DCSync — Hash Dump Results[/bold bright_cyan]",
+        box=box.ROUNDED, border_style="bright_blue", show_lines=True, expand=False,
+    )
+    table.add_column("Property", style="bold bright_cyan", width=22)
+    table.add_column("Value",    style="white")
+    table.add_row("Accounts Dumped", f"[bold red]{len(hashes)}[/bold red]")
+    table.add_row("Saved to",        result["hash_file"] or "N/A")
+    table.add_row("krbtgt NT hash",  f"[bold red]{result['krbtgt_nt'][:16]}…[/bold red]" if result.get("krbtgt_nt") else "[dim]Not found[/dim]")
+    table.add_row("Admin NT hash",   f"[bold red]{result['admin_nt'][:16]}…[/bold red]" if result.get("admin_nt") else "[dim]Not found[/dim]")
+    console.print(); console.print(table)
+
+    # Show first 5 accounts
+    if hashes:
+        ht = Table(box=box.SIMPLE, border_style="red", show_lines=True)
+        ht.add_column("Username",  style="bold yellow", width=22)
+        ht.add_column("NT Hash",   style="dim",         width=36)
+        for h in hashes[:5]:
+            ht.add_row(h["username"], h["nt"])
+        if len(hashes) > 5:
+            ht.add_row(f"… +{len(hashes)-5} more", "(see dump file)")
+        console.print(ht)
+
+    if result.get("krbtgt_nt"):
+        console.print(f"\n  [bold yellow]→ krbtgt hash ready for Golden Ticket forging.[/bold yellow]")
+        console.print(f"  [dim]Use Phase 3 → Golden Ticket to forge a .ccache[/dim]\n")
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
+
+def _display_golden_ticket_results(result: dict) -> None:
+    """Display Golden Ticket forge results."""
+    if result["status"] == "error":
+        console.print(f"\n  [bold red]✘  Golden Ticket failed:[/bold red] {result['error']}\n")
+        return
+
+    console.print()
+    console.print(f"  [bold green]✔  Golden Ticket forged for:[/bold green] [bold red]{result['target_user']}[/bold red]")
+    console.print(f"  [dim]Ticket: {result['ticket_path']}[/dim]")
+    console.print()
+    console.print(f"  [bold yellow]Load ticket:[/bold yellow]")
+    console.print(f"  [bright_white]{result['export_cmd']}[/bright_white]")
+    console.print()
+    console.print(f"  [bold yellow]Use ticket (psexec):[/bold yellow]")
+    console.print(f"  [bright_white]{result['use_cmd']}[/bright_white]")
+
+    for w in result.get("warnings", []):
+        console.print(f"\n  [yellow]⚠  {w}[/yellow]")
+    console.print()
+
 
 def start_new_assessment() -> AssessmentState:
     console.rule("[bold bright_cyan]New Assessment Setup[/bold bright_cyan]")
@@ -586,6 +760,7 @@ def _resolve_action_key(action_name: str) -> str:
         "kerberoasting":        "kerberoasting",
         "as-rep roasting":      "asreproasting",
         "winrm":                "winrm",
+        "evil-winrm":           "winrm",
         "password spraying":    "spraying",
         "smb relay":            "smbrelay",
         "pass-the-hash":        "passthehash",
@@ -596,6 +771,14 @@ def _resolve_action_key(action_name: str) -> str:
         "ad web services":      "adws",
         "run port":             "portscan",
         "port & service scan":  "portscan",
+        "responder":            "responder",
+        "llmnr":                "responder",
+        "credential validation":"credvalidation",
+        "acl abuse":            "aclabuse",
+        "writedacl":            "aclabuse",
+        "dcsync":               "dcsync",
+        "secretsdump":          "dcsync",
+        "golden ticket":        "goldenticket",
     }
 
     for keyword, key in mapping.items():
@@ -662,95 +845,46 @@ def assessment_menu(state: AssessmentState) -> None:
         console.rule("[bold bright_cyan]Assessment Menu[/bold bright_cyan]")
         console.print()
 
-        # ── Smart guide (promoted — most useful entry point) ──────────────
-        console.print("  [bold bright_cyan]★[/bold bright_cyan]  [bold bright_cyan]7.[/bold bright_cyan]  [bold white]Auto-Suggest Next Step[/bold white]  [dim](recommended — engine picks the best action based on current findings)[/dim]")
+        # ── Smart guide ──────────────────────────────────────────────────
+        console.print("  [bold bright_cyan]★[/bold bright_cyan]  [bold bright_cyan]A.[/bold bright_cyan]  [bold white]Auto-Suggest Next Step[/bold white]  [dim](recommended)[/dim]")
         console.print()
 
-        # ── RECON ─────────────────────────────────────────────────────────
-        console.print("  [dim]── RECON ──────────────────────────────────────────────────[/dim]")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan          [dim](nmap — always run this first)[/dim]")
-        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration             [dim](users, groups, SPNs, AS-REP targets)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute  [dim](shares, signing, user discovery)[/dim]")
+        # ── PHASES ──────────────────────────────────────────────────
+        console.print("  [dim]── PHASES ────────────────────────────────────────────────────[/dim]")
+        console.print("  [bright_cyan]1.[/bright_cyan]  Phase 1 — Recon              [dim](nmap, ldap, smb)[/dim]")
+        console.print("  [bright_cyan]2.[/bright_cyan]  Phase 2 — Exploitation       [dim](AS-REP, Kerb, Spray, Responder, Cred Validation)[/dim]")
+        console.print("  [bright_cyan]3.[/bright_cyan]  Phase 3 — Post-Exploitation  [dim](ACL Abuse, Evil-WinRM, DCSync, PTH, Golden Ticket)[/dim]")
         console.print()
 
-        # ── ATTACKS ───────────────────────────────────────────────────────
-        console.print("  [dim]── ATTACKS ────────────────────────────────────────────────[/dim]")
-        console.print("  [bright_cyan]4.[/bright_cyan]  AS-REP Roasting              [dim](port 88 required — no creds needed)[/dim]")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Kerberoasting                [dim](port 88 + valid creds required)[/dim]")
-        console.print("  [bright_cyan]6.[/bright_cyan]  Password Spraying            [dim](users required — lockout detection on)[/dim]")
-        console.print()
-
-        # ── SESSION ───────────────────────────────────────────────────────
+        # ── SESSION ────────────────────────────────────────────────
         console.print("  [dim]── SESSION ────────────────────────────────────────────────[/dim]")
-        console.print("  [bright_cyan]8.[/bright_cyan]  View Findings Log")
-        console.print("  [bright_cyan]9.[/bright_cyan]  Save & Return to Main Menu")
+        console.print("  [bright_cyan]4.[/bright_cyan]  View Findings Log")
+        console.print("  [bright_cyan]5.[/bright_cyan]  Save & Return to Main Menu")
         console.print()
 
         choice = Prompt.ask(
             "  [bold yellow]Select option[/bold yellow]",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            choices=["a", "A", "1", "2", "3", "4", "5"],
             show_choices=False,
         )
 
-        if choice == "1":
-            from modules.nmap_module import run as nmap_run
-            nmap_run(state)
-            save_session(state)
-
-        elif choice == "2":
-            from modules.ldap_enum_module import run as ldap_run
-            result = ldap_run(state)
-            _display_ldap_results(result)
-            save_session(state)
-
-        elif choice == "3":
-            from modules.smb_enum_module import run as smb_run
-            smb_run(state)
-            save_session(state)
-
-        elif choice == "4":
-            from modules.asrep_roasting_module import run as asrep_run
-            result = asrep_run(state)
-            _display_asrep_results(result)
-            save_session(state)
-
-        elif choice == "5":
-            from modules.kerberoasting_module import run as kerb_run
-            result = kerb_run(state)
-            _display_kerb_results(result)
-            save_session(state)
-
-        elif choice == "6":
-            passwords = Prompt.ask(
-                "  [bold yellow]Password(s) to spray[/bold yellow] "
-                "[dim](comma-separated, e.g. Password123!)[/dim]"
-            ).split(",")
-            passwords = [p.strip() for p in passwords if p.strip()]
-            if passwords:
-                from modules.password_spray_module import run as spray_run
-                preview = spray_run(state, passwords=passwords, confirmed=False)
-                _display_spray_results(preview)
-                confirm = Prompt.ask(
-                    "\n  [bold red]Execute spray?[/bold red]",
-                    choices=["yes", "no"], default="no",
-                )
-                if confirm == "yes":
-                    result = spray_run(state, passwords=passwords, confirmed=True)
-                    _display_spray_results(result)
-                    save_session(state)
-
-        elif choice == "7":
+        if choice.lower() == "a":
             execute_suggested_action(state)
-
-        elif choice == "8":
+        elif choice == "1":
+            _phase1_recon_menu(state)
+        elif choice == "2":
+            _phase2_exploitation_menu(state)
+        elif choice == "3":
+            _phase3_postex_menu(state)
+        elif choice == "4":
             _display_findings_log(state)
-
-        elif choice == "9":
+        elif choice == "5":
             path = save_session(state)
-            console.print(
-                f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n"
-            )
+            console.print(f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n")
             break
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

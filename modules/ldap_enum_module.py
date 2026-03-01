@@ -370,21 +370,35 @@ class LDAPEnumerationModule:
 
         groups = _parse_groups(group_entries)
 
-        # ── Step D: Update AssessmentState ────────────────────────────
+        # ── Step D: Password policy ────────────────────────────────────
+        policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds)
+        if policy:
+            state.password_policy = policy
+
+        # ── Step E: ldapdomaindump (when creds available) ─────────────
+        if bind_creds and bind_creds.username:
+            dump_path = self._run_ldapdomaindump(target, domain, bind_creds)
+            if dump_path:
+                state.domain_dump_path = dump_path
+                warnings.append(f"ldapdomaindump output saved to: {dump_path}")
+
+        # ── Step F: Update AssessmentState ────────────────────────────
         self._update_state(state, target, users, asrep_users, groups,
                            spn_records, desc_findings, anon_ok, warnings)
 
         return {
-            "status":        "success",
-            "anonymous":     anon_ok,
-            "ldaps":         use_ldaps,
-            "users":         users,
-            "asrep_users":   asrep_users,
-            "groups":        groups,
-            "spns":          spn_records,
-            "desc_findings": desc_findings,
-            "error":         None,
-            "warnings":      warnings,
+            "status":           "success",
+            "anonymous":        anon_ok,
+            "ldaps":            use_ldaps,
+            "users":            users,
+            "asrep_users":      asrep_users,
+            "groups":           groups,
+            "spns":             spn_records,
+            "desc_findings":    desc_findings,
+            "password_policy":  policy,
+            "domain_dump_path": state.domain_dump_path,
+            "error":            None,
+            "warnings":         warnings,
         }
 
     # ------------------------------------------------------------------ #
@@ -671,9 +685,77 @@ class LDAPEnumerationModule:
         result = self.executor.run(args)
         return result["output"]
 
-    # ------------------------------------------------------------------ #
-    #  Private helpers                                                     #
-    # ------------------------------------------------------------------ #
+    def _query_password_policy(
+        self,
+        target:    str,
+        base_dn:   str,
+        port:      int,
+        use_ldaps: bool,
+        creds,
+    ) -> dict:
+        """
+        Query domain password policy attributes.
+
+        Exact playbook command:
+            ldapsearch -H ldap://<target> -x -b <base_dn> "(objectClass=domain)"
+                maxPwdAge minPwdLength pwdHistoryLength lockoutThreshold
+                lockoutDuration lockOutObservationWindow
+        """
+        args = self._build_base_args(target, port, use_ldaps, creds)
+        args += [
+            "-b", base_dn,
+            "-s", "base",
+            "(objectClass=domain)",
+            "maxPwdAge", "minPwdLength", "pwdHistoryLength",
+            "lockoutThreshold", "lockoutDuration", "lockOutObservationWindow",
+        ]
+        result = self.executor.run(args, timeout=30)
+        if not result["output"]:
+            return {}
+        policy: dict = {}
+        for line in result["output"].splitlines():
+            if ":" in line and not line.startswith("#"):
+                k, _, v = line.partition(":")
+                k = k.strip().lower()
+                v = v.strip()
+                if k in (
+                    "minpwdlength", "pwdhistorylength", "lockoutthreshold",
+                    "maxpwdage", "lockoutduration", "lockoutobservationwindow",
+                ):
+                    policy[k] = v
+        return policy
+
+    def _run_ldapdomaindump(
+        self,
+        target: str,
+        domain: str,
+        creds,
+    ) -> "str | None":
+        """
+        Run ldapdomaindump if available.
+
+        Exact playbook command:
+            ldapdomaindump -u <domain>\\<user> -p <pass> ldap://<target> --no-json --no-grep -o <dir>
+        """
+        if not self.executor.check_tool("ldapdomaindump"):
+            return None
+        safe_domain = domain.replace(".", "_")
+        output_dir = os.path.abspath(os.path.join("reports", f"{safe_domain}-dump"))
+        os.makedirs(output_dir, exist_ok=True)
+        cmd = [
+            "ldapdomaindump",
+            "-u", f"{domain}\\{creds.username}",
+            "-p", creds.password,
+            f"ldap://{target}",
+            "--no-json",
+            "--no-grep",
+            "-o", output_dir,
+        ]
+        result = self.executor.run(cmd, timeout=60)
+        if result["status"] == "success" or os.path.isdir(output_dir):
+            return output_dir
+        return None
+
 
     @staticmethod
     def _error(message: str) -> dict:
