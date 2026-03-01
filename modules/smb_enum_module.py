@@ -576,18 +576,78 @@ class SMBEnumerationModule:
         self, target: str, raw_log: list[str]
     ) -> tuple[list[str], list[str]]:
         """
-        Step 3 — RID brute-force.
+        Step 3 — RID brute-force via PTY.
 
-        WHY --log file approach:
-        nxc uses Rich live display that writes directly to the terminal,
-        bypassing stdout when not connected to a TTY. subprocess.PIPE captures
-        stdout/stderr but nxc's actual enumeration output never arrives there.
-        Using --log <tmpfile> forces nxc to write plain text to a file
-        regardless of TTY state — guaranteed capture.
+        WHY PTY:
+        nxc calls sys.stdout.isatty() and only writes its Rich enumeration
+        output when connected to a real terminal. subprocess.PIPE is detected
+        as non-TTY so output is suppressed. pty.openpty() creates a real
+        pseudo-terminal that fools nxc into producing its normal output.
 
-        Tries guest first (matches working playbook), then null session fallback.
+        Tries guest first (user's working command), then null session fallback.
         """
-        import tempfile
+        import pty
+        import select
+        import re as _re
+        import subprocess as _sp
+
+        # Strip ANSI escape codes from captured PTY output
+        _ansi = _re.compile(r"\x1b\[[0-9;]*[mGKHF]|\x1b\[?[0-9;]*[a-zA-Z]|\r")
+
+        def _run_pty(cmd: list[str], timeout: int = 120) -> str:
+            """Run cmd through a PTY and return full captured output as str."""
+            master_fd, slave_fd = pty.openpty()
+            chunks: list[bytes] = []
+            try:
+                proc = _sp.Popen(
+                    cmd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    stdin=slave_fd,
+                    close_fds=True,
+                )
+                os.close(slave_fd)
+                import time
+                deadline = time.time() + timeout
+                while True:
+                    remaining = max(0, deadline - time.time())
+                    if remaining == 0:
+                        proc.kill()
+                        break
+                    ready, _, _ = select.select([master_fd], [], [], min(remaining, 1.0))
+                    if ready:
+                        try:
+                            data = os.read(master_fd, 4096)
+                            if data:
+                                chunks.append(data)
+                            else:
+                                break
+                        except OSError:
+                            break
+                    if proc.poll() is not None:
+                        # Drain any remaining output
+                        try:
+                            while True:
+                                ready, _, _ = select.select([master_fd], [], [], 0.2)
+                                if not ready:
+                                    break
+                                data = os.read(master_fd, 4096)
+                                if data:
+                                    chunks.append(data)
+                                else:
+                                    break
+                        except OSError:
+                            pass
+                        break
+                proc.wait(timeout=5)
+            finally:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            raw_bytes = b"".join(chunks)
+            raw_str = raw_bytes.decode("utf-8", errors="replace")
+            return _ansi.sub("", raw_str)
 
         cme = self._find_cme()
         if not cme:
@@ -595,46 +655,25 @@ class SMBEnumerationModule:
             return [], []
 
         for user, label in [("guest", "guest"), ("", "null session")]:
-            # Write to a temp log file — nxc plain-text output is always there
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", prefix="adpf_rid_",
-                delete=False
-            ) as tmp:
-                log_path = tmp.name
-
-            cmd = [
-                cme, "smb", target,
-                "-u", user, "-p", "",
-                "--rid-brute",
-                "--log", log_path,
-            ]
+            cmd = [cme, "smb", target, "-u", user, "-p", "", "--rid-brute"]
             raw_log.append(
-                f"## Step 3 ({label}): {cme} smb {target} "
-                f"-u '{user}' -p '' --rid-brute --log {log_path}"
+                f"## Step 3 ({label}): {' '.join(cmd)}"
             )
-
+            output = ""
             try:
-                self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
+                output = _run_pty(cmd, timeout=120)
             except Exception as exc:
-                raw_log.append(f"## Step 3 ({label}) run error: {exc}")
-
-            # Read the log file — nxc always writes here
-            file_output = ""
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                    file_output = fh.read()
-            except OSError:
-                pass
-            finally:
+                raw_log.append(f"## Step 3 ({label}) PTY error: {exc} — falling back to PIPE")
                 try:
-                    os.unlink(log_path)
-                except OSError:
-                    pass
+                    result = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
+                    output = result["output"] + result["error"]
+                except Exception as exc2:
+                    raw_log.append(f"## Step 3 ({label}) PIPE fallback error: {exc2}")
 
-            raw_log.append(f"## Step 3 ({label}) log output:\n{file_output}")
+            raw_log.append(f"## Step 3 ({label}) output:\n{output[:2000]}")
 
-            if file_output.strip():
-                users, groups = parse_rid_output(file_output)
+            if output.strip():
+                users, groups = parse_rid_output(output)
                 if users or groups:
                     return users, groups
 
