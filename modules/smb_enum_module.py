@@ -503,23 +503,53 @@ class SMBEnumerationModule:
                 console.print("  [bold]Step 4[/bold] [dim]→ IPC$ RPC channel analysis[/dim]")
             ipc_channels = self._smbmap_ipc_check(target)
 
-        # ── STEP 5: Write clean files ────────────────────────────────────────
+        # ── STEP 5: Write clean files + display separated tables ────────────────
         if rid_users:
             from modules.file_export import save_rid_users, save_rid_groups
             users_path  = save_rid_users(rid_users)
             groups_path = save_rid_groups(rid_groups)
+
             if _RICH_AVAILABLE:
-                preview = ", ".join(rid_users[:12])
-                if len(rid_users) > 12:
-                    preview += f" ... (+{len(rid_users)-12} more)"
+                # ── Users table ────────────────────────────────────────────────
+                u_table = Table(
+                    title=f"[bold bright_cyan]Users Discovered via RID Brute ({len(rid_users)} total)[/bold bright_cyan]",
+                    box=box.SIMPLE,
+                    border_style="bright_blue",
+                    show_lines=False,
+                    expand=False,
+                )
+                u_table.add_column("#",    style="dim",         width=4)
+                u_table.add_column("Username", style="bold yellow", width=30)
+                for i, u in enumerate(rid_users, 1):
+                    u_table.add_row(str(i), u)
+                console.print()
+                console.print(u_table)
+
+                # ── Groups table ───────────────────────────────────────────────
+                if rid_groups:
+                    g_table = Table(
+                        title=f"[bold bright_cyan]Groups Discovered via RID Brute ({len(rid_groups)} total)[/bold bright_cyan]",
+                        box=box.SIMPLE,
+                        border_style="bright_blue",
+                        show_lines=False,
+                        expand=False,
+                    )
+                    g_table.add_column("#",     style="dim",  width=4)
+                    g_table.add_column("Group", style="white", width=40)
+                    for i, g in enumerate(rid_groups, 1):
+                        g_table.add_row(str(i), g)
+                    console.print()
+                    console.print(g_table)
+
+                # ── Files summary ──────────────────────────────────────────
                 console.print(
                     Panel(
-                        f"[bold green]✔  {len(rid_users)} users  → {users_path}[/bold green]\n"
-                        f"[bold green]✔  {len(rid_groups)} groups → {groups_path}[/bold green]\n"
-                        f"[bold green]✔  Merged  → generated/users-all.txt[/bold green]\n\n"
-                        f"[dim]{preview}[/dim]",
-                        title="[bold bright_cyan]RID Brute-Force — Files Written[/bold bright_cyan]",
-                        border_style="bright_blue",
+                        f"[green]✔[/green]  {users_path}\n"
+                        f"[green]✔[/green]  {groups_path}\n"
+                        f"[green]✔[/green]  generated/users-all.txt  (merged)",
+                        title="[bold green]Files Written[/bold green]",
+                        border_style="green",
+                        expand=False,
                     )
                 )
 
@@ -754,14 +784,13 @@ class SMBEnumerationModule:
 
     def _rid_brute(self, target: str) -> tuple[list[str], list[str]]:
         """
-        Step 3: RID brute force.
-        Tries null session first, then guest session.
-        nxc smb target -u '' -p '' --rid-brute
-        nxc smb target -u 'guest' -p '' --rid-brute
-        Returns (users, groups) with machine accounts ($) filtered out.
+        Step 3: RID brute force (silent executor — output is parsed, not printed raw).
+        Tries null session first, then guest.
         """
+        # Use a quiet executor — raw nxc --rid-brute output is very noisy
+        quiet_exec = CommandExecutor(verbose=False, default_timeout=120)
         cme_bin = next(
-            (b for b in ("nxc", "crackmapexec", "cme") if self.executor.check_tool(b)),
+            (b for b in ("nxc", "crackmapexec", "cme") if quiet_exec.check_tool(b)),
             None,
         )
         if not cme_bin:
@@ -770,10 +799,9 @@ class SMBEnumerationModule:
         for user, label in [("", "null session"), ("guest", "guest")]:
             if _RICH_AVAILABLE:
                 console.print(
-                    f"  [dim]→ Running RID brute ({label}): "
-                    f"{cme_bin} smb {target} -u '{user}' -p '' --rid-brute[/dim]"
+                    f"  [dim]→ {cme_bin} smb {target} -u '{user}' -p '' --rid-brute  ({label})[/dim]"
                 )
-            result = self.executor.run(
+            result = quiet_exec.run(
                 [cme_bin, "smb", target, "-u", user, "-p", "", "--rid-brute"],
                 ok_exit_codes=(0, 1),
             )
