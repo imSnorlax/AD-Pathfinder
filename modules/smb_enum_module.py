@@ -568,7 +568,7 @@ class SMBEnumerationModule:
         if not cme:
             return [], []
 
-        for user, label in [("", "null"), ("guest", "guest")]:
+        for user, label in [("guest", "guest"), ("", "null session")]:
             raw_log.append(
                 f"## Step 3 ({label}): {cme} smb {target} "
                 f"-u '{user}' -p '' --rid-brute"
