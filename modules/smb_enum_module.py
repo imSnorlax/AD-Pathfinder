@@ -331,52 +331,125 @@ class SMBEnumerationModule:
     def run(self, state: AssessmentState) -> dict:
         """
         Execute the full SMB enumeration playbook against state.target_ip.
+        All steps run sequentially. No early returns. Failures are caught
+        per-step so the rest of the flow always continues.
 
-        Updates state in-place:
-            state.users              — discovered user accounts
-            state.groups             — discovered groups
-            state.vulnerabilities    — SMB signing disabled entry (if applicable)
-            state.findings_log       — structured log entries
-            state.performed_actions  — timestamped audit trail
-
-        Returns a structured findings dict (see module docstring).
+        Execution order
+        ---------------
+        1. SMB signing / version fingerprint
+        2. Share enumeration  (nxc guest → smbmap → smbclient fallback)
+        3. RID brute-force    (null session → guest fallback)
+        4. IPC$ RPC channel analysis
+        5. Artifact persistence  (reports/<id>/users_rid.txt, smb_raw.txt)
+        6. State updates
+        7. Return structured summary
         """
         target        = state.target_ip
         creds         = state.initial_credentials
         assessment_id = state.assessment_id
-        raw_log_parts: list[str] = []   # accumulate raw output for smb_raw.txt
+        raw_log_parts: list[str] = []
 
-        # ── Step 1: Guest share listing ──────────────────────────────────────
-        shares, anonymous_access = self._step1_shares(target, raw_log_parts)
+        # Initialise result variables — populated per step, never short-circuit
+        smb_signing:      Optional[bool] = None
+        smb_version:      str            = "Unknown"
+        shares:           list[str]      = []
+        anonymous_access: bool           = False
+        rid_users:        list[str]      = []
+        rid_groups:       list[str]      = []
+        ipc_channels:     list[str]      = []
+        users_file:       Optional[str]  = None
 
-        # ── Step 2: Signing / version fingerprint ────────────────────────────
-        smb_signing, smb_version = self._step2_signing(target, creds, raw_log_parts)
+        _con = None
+        try:
+            from rich.console import Console
+            _con = Console()
+        except ImportError:
+            pass
 
-        # ── Step 3: RID brute-force ───────────────────────────────────────────
-        rid_users, rid_groups = self._step3_rid_brute(target, raw_log_parts)
+        def _info(msg: str) -> None:
+            if _con:
+                _con.print(f"  [dim]{msg}[/dim]")
+            else:
+                print(f"  {msg}")
 
-        # ── Step 4: IPC$ RPC channel analysis ────────────────────────────────
-        ipc_channels: list[str] = []
-        if any(s.upper() == "IPC$" for s in shares):
-            ipc_channels = self._step4_ipc(target, raw_log_parts)
+        def _step_banner(n: int, label: str) -> None:
+            if _con:
+                _con.print(f"\n  [bold bright_cyan][ Step {n} ][/bold bright_cyan] {label}")
+            else:
+                print(f"\n  [ Step {n} ] {label}")
 
-        # ── Step 5: Persist artifacts ─────────────────────────────────────────
-        raw_combined  = "\n".join(raw_log_parts)
-        users_file    = None
+        # ── STEP 1: SMB Signing / Version Fingerprint ─────────────────────────
+        _step_banner(1, "SMB signing / version fingerprint")
+        try:
+            smb_signing, smb_version = self._step_signing(
+                target, creds, raw_log_parts
+            )
+            _info(
+                f"Signing: {'Enabled' if smb_signing else 'DISABLED' if smb_signing is False else 'Unknown'}"
+                f"  |  Version: {smb_version}"
+            )
+        except Exception as exc:
+            raw_log_parts.append(f"## Step 1 ERROR: {exc}")
+            _info(f"Signing check failed: {exc}")
 
-        _write_raw_log(assessment_id, raw_combined)
+        # ── STEP 2: Share Enumeration ─────────────────────────────────────────
+        _step_banner(2, "Share enumeration (guest)")
+        try:
+            shares, anonymous_access = self._step_shares(target, raw_log_parts)
+            _info(f"Shares found: {len(shares)}  →  {', '.join(shares) if shares else 'none'}")
+        except Exception as exc:
+            raw_log_parts.append(f"## Step 2 ERROR: {exc}")
+            _info(f"Share enumeration failed: {exc}")
 
-        if rid_users:
-            users_file = _write_users_file(assessment_id, rid_users)
-            _write_generated(rid_users, rid_groups)
+        # ── STEP 3: RID Brute-Force ───────────────────────────────────────────
+        _step_banner(3, "RID brute-force  (null → guest)")
+        try:
+            rid_users, rid_groups = self._step_rid_brute(target, raw_log_parts)
+            _info(
+                f"Users: {len(rid_users)}  |  Groups: {len(rid_groups)}"
+                + (f"  →  preview: {', '.join(rid_users[:5])}" if rid_users else "")
+            )
+        except Exception as exc:
+            raw_log_parts.append(f"## Step 3 ERROR: {exc}")
+            _info(f"RID brute failed: {exc}")
 
-        # ── Update AssessmentState ────────────────────────────────────────────
-        self._update_state(
-            state, shares, smb_signing, rid_users, rid_groups,
-            ipc_channels, anonymous_access, users_file,
-        )
+        # ── STEP 4: IPC$ RPC Channel Analysis ────────────────────────────────
+        _step_banner(4, "IPC$ RPC channel analysis")
+        try:
+            ipc_channels = self._step_ipc(target, raw_log_parts)
+            _info(f"Named pipes found: {len(ipc_channels)}")
+        except Exception as exc:
+            raw_log_parts.append(f"## Step 4 ERROR: {exc}")
+            _info(f"IPC$ analysis failed: {exc}")
 
-        # ── Build return dict ─────────────────────────────────────────────────
+        # ── STEP 5: Persist Artifacts ─────────────────────────────────────────
+        _step_banner(5, "Saving artifacts")
+        try:
+            raw_combined = "\n".join(raw_log_parts)
+            _write_raw_log(assessment_id, raw_combined)
+            _info(f"Raw log → reports/{assessment_id}/smb_raw.txt")
+
+            if rid_users:
+                users_file = _write_users_file(assessment_id, rid_users)
+                _info(f"Users  → {users_file}")
+                _write_generated(rid_users, rid_groups)
+                _info("Users synced → generated/users-all.txt")
+            else:
+                raw_combined = "\n".join(raw_log_parts)
+                _info("No users to save — users_rid.txt skipped")
+        except Exception as exc:
+            raw_log_parts.append(f"## Step 5 ERROR: {exc}")
+            _info(f"Artifact write failed: {exc}")
+
+        # ── STEP 6 & 7: Update State & Return ────────────────────────────────
+        try:
+            self._update_state(
+                state, shares, smb_signing, rid_users, rid_groups,
+                ipc_channels, anonymous_access, users_file,
+            )
+        except Exception as exc:
+            _info(f"State update failed: {exc}")
+
         findings: dict = {
             "anonymous_access": anonymous_access,
             "smb_signing":      smb_signing,
@@ -387,13 +460,12 @@ class SMBEnumerationModule:
             "users_preview":    rid_users[:5],
             "users_file":       users_file,
             "ipc_channels":     ipc_channels,
-            # Full lists for display layer
             "rid_users":        rid_users,
             "rid_groups":       rid_groups,
         }
 
         if self.debug:
-            findings["raw_log"] = raw_combined
+            findings["raw_log"] = "\n".join(raw_log_parts)
 
         suggestions = _build_suggestions(
             anonymous_access, smb_signing, shares, state.performed_actions
@@ -410,11 +482,11 @@ class SMBEnumerationModule:
     #  Step implementations                                                #
     # ------------------------------------------------------------------ #
 
-    def _step1_shares(
+    def _step_shares(
         self, target: str, raw_log: list[str]
     ) -> tuple[list[str], bool]:
         """
-        Step 1 — List shares as guest.
+        Step 2 — List shares as guest.
         Tries nxc --shares first, falls back to smbmap, then smbclient -N.
         Returns (shares, anonymous_access_flag).
         """
@@ -459,11 +531,11 @@ class SMBEnumerationModule:
 
         return [], False
 
-    def _step2_signing(
+    def _step_signing(
         self, target: str, creds, raw_log: list[str]
     ) -> tuple[Optional[bool], str]:
         """
-        Step 2 — SMB signing / version check via nxc (verbose — one line).
+        Step 1 — SMB signing / version check via nxc (verbose — one line).
         Returns (smb_signing, smb_version).
         """
         cme = self._find_cme()
@@ -484,7 +556,7 @@ class SMBEnumerationModule:
 
         return _parse_signing(combined)
 
-    def _step3_rid_brute(
+    def _step_rid_brute(
         self, target: str, raw_log: list[str]
     ) -> tuple[list[str], list[str]]:
         """
@@ -515,7 +587,7 @@ class SMBEnumerationModule:
 
         return [], []
 
-    def _step4_ipc(
+    def _step_ipc(
         self, target: str, raw_log: list[str]
     ) -> list[str]:
         """
