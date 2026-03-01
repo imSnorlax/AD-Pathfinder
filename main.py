@@ -835,8 +835,126 @@ def _display_findings_log(state: AssessmentState) -> None:
 # Assessment menu
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _phase1_recon_menu(state: AssessmentState) -> None:
+    """Phase 1 — Recon sub-menu."""
+    while True:
+        console.print()
+        console.rule("[bold bright_cyan]Phase 1 — Recon[/bold bright_cyan]")
+        console.print()
+        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan        [dim](nmap — run first)[/dim]")
+        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration           [dim](users/groups/SPNs/policy/ldapdomaindump)[/dim]")
+        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute[dim](shares, guest creds, user/group discovery)[/dim]")
+        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
+        console.print()
+        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3"], show_choices=False)
+        if choice == "0":
+            break
+        elif choice == "1":
+            from modules.nmap_module import run as nmap_run
+            nmap_run(state)
+            save_session(state)
+        elif choice == "2":
+            from modules.ldap_enum_module import run as ldap_run
+            result = ldap_run(state)
+            _display_ldap_results(result)
+            save_session(state)
+        elif choice == "3":
+            from modules.smb_enum_module import run as smb_run
+            smb_run(state)
+            save_session(state)
+
+
+def _phase2_exploitation_menu(state: AssessmentState) -> None:
+    """Phase 2 — Exploitation sub-menu."""
+    while True:
+        console.print()
+        console.rule("[bold bright_cyan]Phase 2 — Exploitation[/bold bright_cyan]")
+        console.print()
+        console.print("  [bright_cyan]1.[/bright_cyan]  AS-REP Roasting      [dim](port 88 — no creds needed)[/dim]")
+        console.print("  [bright_cyan]2.[/bright_cyan]  Kerberoasting        [dim](port 88 + valid creds required)[/dim]")
+        console.print("  [bright_cyan]3.[/bright_cyan]  Password Spraying    [dim](users required — lockout detection on)[/dim]")
+        console.print("  [bright_cyan]4.[/bright_cyan]  Responder / LLMNR    [dim](same network — captures NetNTLMv2)[/dim]")
+        console.print("  [bright_cyan]5.[/bright_cyan]  Credential Validation[dim](netexec --users + smbpasswd reset)[/dim]")
+        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
+        console.print()
+        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
+        if choice == "0":
+            break
+        elif choice == "1":
+            from modules.asrep_roasting_module import run as asrep_run
+            result = asrep_run(state)
+            _display_asrep_results(result)
+            save_session(state)
+        elif choice == "2":
+            from modules.kerberoasting_module import run as kerb_run
+            result = kerb_run(state)
+            _display_kerb_results(result)
+            save_session(state)
+        elif choice == "3":
+            passwords = Prompt.ask(
+                "  [bold yellow]Password(s) to spray[/bold yellow] [dim](comma-separated)[/dim]"
+            ).split(",")
+            passwords = [p.strip() for p in passwords if p.strip()]
+            if passwords:
+                from modules.password_spray_module import run as spray_run
+                preview = spray_run(state, passwords=passwords, confirmed=False)
+                _display_spray_results(preview)
+                if Prompt.ask("  [bold red]Execute spray?[/bold red]", choices=["yes", "no"], default="no") == "yes":
+                    result = spray_run(state, passwords=passwords, confirmed=True)
+                    _display_spray_results(result)
+                    save_session(state)
+        elif choice == "4":
+            from modules.responder_module import run as responder_run
+            result = responder_run(state)
+            _display_responder_results(result)
+            save_session(state)
+        elif choice == "5":
+            from modules.cred_validation_module import run as cred_run
+            result = cred_run(state)
+            _display_cred_validation_results(result)
+            save_session(state)
+
+
+def _phase3_postex_menu(state: AssessmentState) -> None:
+    """Phase 3 — Post-Exploitation sub-menu."""
+    while True:
+        console.print()
+        console.rule("[bold bright_cyan]Phase 3 — Post-Exploitation[/bold bright_cyan]")
+        console.print()
+        console.print("  [bright_cyan]1.[/bright_cyan]  ACL Abuse / WriteDACL[dim](net rpc group addmembers)[/dim]")
+        console.print("  [bright_cyan]2.[/bright_cyan]  Evil-WinRM Shell     [dim](password auth, port 5985/5986)[/dim]")
+        console.print("  [bright_cyan]3.[/bright_cyan]  DCSync               [dim](impacket-secretsdump — all domain hashes)[/dim]")
+        console.print("  [bright_cyan]4.[/bright_cyan]  Pass-the-Hash (PTH)  [dim](evil-winrm -H <nt_hash>)[/dim]")
+        console.print("  [bright_cyan]5.[/bright_cyan]  Golden Ticket        [dim](impacket-ticketer — needs krbtgt NT hash)[/dim]")
+        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
+        console.print()
+        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
+        if choice == "0":
+            break
+        elif choice == "1":
+            from modules.acl_abuse_module import run as acl_run
+            result = acl_run(state)
+            _display_acl_results(result)
+            save_session(state)
+        elif choice in ("2", "4"):
+            from modules.evil_winrm_module import run as winrm_run
+            winrm_run(state)
+            save_session(state)
+        elif choice == "3":
+            from modules.dcsync_module import run as dcsync_run
+            result = dcsync_run(state)
+            _display_dcsync_results(result)
+            save_session(state)
+        elif choice == "5":
+            from modules.golden_ticket_module import run as gt_run
+            result = gt_run(state)
+            _display_golden_ticket_results(result)
+            save_session(state)
+
+
 def assessment_menu(state: AssessmentState) -> None:
     """Main interaction loop for an active assessment session."""
+
     while True:
         console.print()
         print_assessment_header(state)
