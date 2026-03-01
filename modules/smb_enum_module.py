@@ -70,6 +70,7 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
         shares    = findings.get("shares",            [])
         rid_users = findings.get("rid_users",         [])
         rid_grps  = findings.get("rid_groups",        [])
+        ipc_chs   = findings.get("ipc_channels",      [])
 
         table.add_row(
             "Anonymous Access",
@@ -111,6 +112,13 @@ def _print_findings(findings: dict, suggestions: list[str]) -> None:
             table.add_row(
                 "RID Groups Found",
                 f"[bold green]{len(rid_grps)}[/bold green] → saved to [dim]generated/groups-rid.txt[/dim]",
+            )
+
+        if ipc_chs:
+            ch_preview = ", ".join(ipc_chs[:8]) + (f" … (+{len(ipc_chs)-8} more)" if len(ipc_chs) > 8 else "")
+            table.add_row(
+                "IPC$ Channels",
+                f"[bold yellow]{len(ipc_chs)} pipe(s)[/bold yellow]: [dim]{ch_preview}[/dim]",
             )
 
         console.print(table)
@@ -234,6 +242,25 @@ def _parse_crackmapexec_output(output: str) -> tuple[Optional[bool], str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # nxc share output parser
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_ipc_channels(output: str) -> list[str]:
+    """
+    Parse named pipe / RPC channel names from smbmap -r IPC$ output.
+    Lines look like:  .\\pipe\\netlogon  or  IPC$  .\\srvsvc
+    We extract the last path component as the channel name.
+    """
+    channels: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        stripped = line.strip()
+        # smbmap -r IPC$ shows entries like:  dr--r--r-- ... .\\pipe\\netlogon
+        if "\\" in stripped or "/" in stripped:
+            name = stripped.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip()
+            if name and name not in seen and not name.startswith("["):
+                channels.append(name)
+                seen.add(name)
+    return channels
+
 
 def _parse_smbmap_shares(output: str) -> list[str]:
     """
@@ -446,63 +473,57 @@ class SMBEnumerationModule:
 
         if _RICH_AVAILABLE:
             console.print(
-                f"\n  [bold bright_cyan]▶  Starting SMB enumeration against {target}[/bold bright_cyan]\n"
+                f"\n  [bold bright_cyan]▶  SMB Enumeration against {target}[/bold bright_cyan]\n"
+                f"  [dim]Following playbook: shares → RID brute → IPC$ RPC analysis[/dim]\n"
             )
-        else:
-            print(f"\n[*] Starting SMB enumeration against {target} ...")
 
-        # ── A) Null session / share enumeration ────────────────────────
-        anonymous_access, shares = self._null_session_check(target)
+        # ── STEP 1: Guest share listing ─────────────────────────────────────────
+        # nxc smb target -u 'guest' -p '' --shares
+        if _RICH_AVAILABLE:
+            console.print("  [bold]Step 1[/bold] [dim]→ Share listing (guest)[/dim]")
+        shares, anonymous_access = self._guest_share_listing(target)
 
-        # ── B) Guest share enum via nxc (user=guest, pass='') ────────────
-        # Many DCs block true null sessions (smbclient -N) but allow guest
-        # authentication.  Try nxc --shares with guest before falling back
-        # to stored credentials.
-        if not shares:
-            guest_shares = self._nxc_guest_share_check(target)
-            if guest_shares:
-                shares = guest_shares
-                anonymous_access = True  # guest-level access is effectively anonymous
-                if _RICH_AVAILABLE:
-                    console.print(
-                        "  [dim]→ Null session denied; guest auth via nxc succeeded.[/dim]"
-                    )
-
-        # ── C) Authenticated share listing (if stored credentials available) ──
-        if not shares and (creds.username and (creds.password or creds.ntlm_hash)):
-            _, shares = self._authenticated_share_check(target, creds)
-
-        # ── D) SMB signing check via nxc/crackmapexec ──────────────────
+        # ── STEP 2: SMB signing / version fingerprint ───────────────────────────
+        if _RICH_AVAILABLE:
+            console.print("  [bold]Step 2[/bold] [dim]→ SMB signing/version check[/dim]")
         smb_signing, smb_version = self._cme_signing_check(target, creds)
 
-        # ── E) RID brute force for users + groups ────────────────────────
-        # nxc smb target -u guest -p '' --rid-brute
-        # Gives us full user and group lists even without LDAP.
-        rid_users, rid_groups = self._rid_brute_check(target)
+        # ── STEP 3: RID brute force ──────────────────────────────────────────
+        # Try null creds first (-u '' -p ''), fall back to guest (-u 'guest' -p '')
+        # nxc smb target -u '' -p '' --rid-brute
+        if _RICH_AVAILABLE:
+            console.print("  [bold]Step 3[/bold] [dim]→ RID brute-force (null then guest)[/dim]")
+        rid_users, rid_groups = self._rid_brute(target)
 
+        # ── STEP 4: IPC$ RPC channel analysis ───────────────────────────────
+        # smbmap -H target -u 'guest' -p '' -r IPC$ --no-banner
+        ipc_channels: list[str] = []
+        if "IPC$" in [s.upper() for s in shares]:
+            if _RICH_AVAILABLE:
+                console.print("  [bold]Step 4[/bold] [dim]→ IPC$ RPC channel analysis[/dim]")
+            ipc_channels = self._smbmap_ipc_check(target)
+
+        # ── STEP 5: Write clean files ────────────────────────────────────────
         if rid_users:
-            # Save to generated/ — clean usernames, one per line
             from modules.file_export import save_rid_users, save_rid_groups
             users_path  = save_rid_users(rid_users)
             groups_path = save_rid_groups(rid_groups)
             if _RICH_AVAILABLE:
-                preview = ", ".join(rid_users[:10])
-                if len(rid_users) > 10:
-                    preview += f" ... (+{len(rid_users)-10} more)"
-                from modules.file_export import save_rid_users as _s
+                preview = ", ".join(rid_users[:12])
+                if len(rid_users) > 12:
+                    preview += f" ... (+{len(rid_users)-12} more)"
                 console.print(
                     Panel(
-                        f"[bold green]✔  {len(rid_users)} users → {users_path}[/bold green]\n"
+                        f"[bold green]✔  {len(rid_users)} users  → {users_path}[/bold green]\n"
                         f"[bold green]✔  {len(rid_groups)} groups → {groups_path}[/bold green]\n"
-                        f"[bold green]✔  Merged into generated/users-all.txt[/bold green]\n\n"
+                        f"[bold green]✔  Merged  → generated/users-all.txt[/bold green]\n\n"
                         f"[dim]{preview}[/dim]",
                         title="[bold bright_cyan]RID Brute-Force — Files Written[/bold bright_cyan]",
                         border_style="bright_blue",
                     )
                 )
 
-
-        # ── Compile findings ───────────────────────────────────────────
+        # ── Compile findings ───────────────────────────────────────────────────
         findings = {
             "shares":           shares,
             "anonymous_access": anonymous_access,
@@ -510,13 +531,11 @@ class SMBEnumerationModule:
             "smb_version":      smb_version,
             "rid_users":        rid_users,
             "rid_groups":       rid_groups,
+            "ipc_channels":     ipc_channels,
         }
 
         suggestions = _build_suggestions(
-            anonymous_access,
-            smb_signing,
-            shares,
-            state.performed_actions,
+            anonymous_access, smb_signing, shares, state.performed_actions
         )
 
         # ── Update AssessmentState ─────────────────────────────────────
@@ -689,6 +708,107 @@ class SMBEnumerationModule:
 
         result = self.executor.run(command)
         return _parse_smbclient_output(result["output"], result["error"])
+
+    def _guest_share_listing(self, target: str) -> tuple[list[str], bool]:
+        """
+        Step 1: List shares using guest credentials.
+        nxc smb target -u 'guest' -p '' --shares
+        Falls back to smbmap if nxc output is empty, then smbclient null session.
+        Returns (shares, anonymous_access_flag).
+        """
+        # Try nxc --shares (primary per playbook)
+        cme_bin = next(
+            (b for b in ("nxc", "crackmapexec", "cme") if self.executor.check_tool(b)),
+            None,
+        )
+        if cme_bin:
+            if _RICH_AVAILABLE:
+                console.print(f"  [dim]→ {cme_bin} smb {target} -u guest -p \"\" --shares[/dim]")
+            result = self.executor.run(
+                [cme_bin, "smb", target, "-u", "guest", "-p", "", "--shares"]
+            )
+            combined = result["output"] + result["error"]
+            shares = _parse_nxc_shares(combined)
+            if shares:
+                return shares, True
+
+        # Fallback: smbmap
+        if self.executor.check_tool("smbmap"):
+            if _RICH_AVAILABLE:
+                console.print(f"  [dim]→ smbmap -H {target} -u guest -p \"\" --no-banner[/dim]")
+            result = self.executor.run(
+                ["smbmap", "-H", target, "-u", "guest", "-p", "", "--no-banner"],
+                ok_exit_codes=(0, 1),
+            )
+            combined = result["output"] + result["error"]
+            shares = _parse_smbmap_shares(combined)
+            if shares:
+                return shares, True
+
+        # Fallback: smbclient null session
+        anon_ok, shares = self._null_session_check(target)
+        if anon_ok:
+            return shares, True
+
+        return [], False
+
+    def _rid_brute(self, target: str) -> tuple[list[str], list[str]]:
+        """
+        Step 3: RID brute force.
+        Tries null session first, then guest session.
+        nxc smb target -u '' -p '' --rid-brute
+        nxc smb target -u 'guest' -p '' --rid-brute
+        Returns (users, groups) with machine accounts ($) filtered out.
+        """
+        cme_bin = next(
+            (b for b in ("nxc", "crackmapexec", "cme") if self.executor.check_tool(b)),
+            None,
+        )
+        if not cme_bin:
+            return [], []
+
+        for user, label in [("", "null session"), ("guest", "guest")]:
+            if _RICH_AVAILABLE:
+                console.print(
+                    f"  [dim]→ Running RID brute ({label}): "
+                    f"{cme_bin} smb {target} -u '{user}' -p '' --rid-brute[/dim]"
+                )
+            result = self.executor.run(
+                [cme_bin, "smb", target, "-u", user, "-p", "", "--rid-brute"],
+                ok_exit_codes=(0, 1),
+            )
+            combined = result["output"] + result["error"]
+            if "[+]" in combined or "SidType" in combined:
+                users, groups = _parse_rid_brute_output(combined)
+                if users or groups:
+                    return users, groups
+
+        return [], []
+
+    def _smbmap_ipc_check(self, target: str) -> list[str]:
+        """
+        Step 4: Enumerate exposed RPC channels via IPC$.
+        smbmap -H target -u 'guest' -p '' -r IPC$ --no-banner
+        Returns a list of pipe/channel names found.
+        """
+        if not self.executor.check_tool("smbmap"):
+            return []
+        if _RICH_AVAILABLE:
+            console.print(
+                f"  [dim]→ smbmap -H {target} -u guest -p '' -r IPC$ --no-banner[/dim]"
+            )
+        result = self.executor.run(
+            ["smbmap", "-H", target, "-u", "guest", "-p", "",
+             "-r", "IPC$", "--no-banner"],
+            ok_exit_codes=(0, 1),
+        )
+        combined = result["output"] + result["error"]
+        channels = _parse_ipc_channels(combined)
+        if channels and _RICH_AVAILABLE:
+            console.print(
+                f"  [dim]→ IPC$: {len(channels)} named pipe(s) found.[/dim]"
+            )
+        return channels
 
     def _nxc_guest_share_check(self, target: str) -> list[str]:
         """
