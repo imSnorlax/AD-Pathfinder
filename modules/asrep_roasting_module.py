@@ -241,15 +241,35 @@ class ASREPRoastingModule:
         from rich.console import Console as _RCon
         _RCon().print(
             f"  [dim]Command: {binary} {domain}/ "
-            f"-usersfile <{len(user_pool)} users>[/dim]"
+            f"-usersfile <{len(user_pool)} users> -dc-ip {target}[/dim]"
         )
 
-        result   = self.executor.run(
-            command,
-            # impacket exits 1 when some users fail (KDC_ERR_CLIENT_REVOKED etc.)
-            # even if hashes were captured for others — treat 0 and 1 as ok.
-            ok_exit_codes=(0, 1),
+        # Build a clean system environment for impacket.
+        # When main.py runs inside a venv, subprocess inherits VIRTUAL_ENV /
+        # PYTHONHOME / PYTHONPATH which can prevent impacket (a system binary)
+        # from finding its system-Python dependencies (e.g. pyasn1).
+        # Stripping those vars lets impacket resolve to its own interpreter.
+        import os as _os
+        clean_env = dict(_os.environ)
+        for _var in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+            clean_env.pop(_var, None)
+        # Restore PATH to include only non-venv entries so the right Python
+        # is used for the impacket shebang.
+        venv_prefix = clean_env.get("VIRTUAL_ENV_PROMPT", "")
+        orig_path   = clean_env.get("PATH", "")
+        venv_bin    = _os.path.join(
+            _os.environ.get("VIRTUAL_ENV", ""), "bin"
         )
+        clean_env["PATH"] = ":".join(
+            p for p in orig_path.split(":") if p != venv_bin
+        )
+
+        result = self.executor.run(
+            command,
+            ok_exit_codes=(0, 1),
+            env=clean_env,
+        )
+
         combined = result["output"] + "\n" + result["error"]
 
         from rich.console import Console as _RCon2
