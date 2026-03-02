@@ -217,6 +217,41 @@ def _parse_groups(entries: list[dict]) -> list[str]:
     ]
 
 
+def _extract_samaccountnames(raw: str) -> list[str]:
+    """
+    Extract sAMAccountName values by scanning for lines that start with
+    the literal prefix ``sAMAccountName:``.
+
+    This is intentionally simpler than the full LDIF block parser and is
+    immune to continuation-line, encoding, or entry-boundary edge cases
+    that can cause the block parser to return an empty list even when
+    ldapsearch actually returned data.
+
+    Parameters
+    ----------
+    raw : str
+        Raw stdout from ldapsearch.
+
+    Returns
+    -------
+    list[str]
+        Deduplicated, stripped list of sAMAccountName values.
+    """
+    seen:  set[str]  = set()
+    users: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        # Match both 'sAMAccountName: value' and 'sAMAccountName:: base64'
+        if line.lower().startswith("samaccountname:"):
+            _, _, value = line.partition(":")
+            # Strip a second colon for base64-encoded values
+            value = value.lstrip(": ").strip()
+            if value and value not in seen:
+                seen.add(value)
+                users.append(value)
+    return users
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LDAPEnumerationModule
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,18 +340,16 @@ class LDAPEnumerationModule:
         use_ldaps = 636 in state.open_ports
         port      = 636 if use_ldaps else 389
 
-        # ── Bind negotiation ──────────────────────────────────────────────────
-        # Rule 1: ALWAYS attempt anonymous bind first — no -D / -W flags.
-        #         ldapsearch -H ldap://<dc_ip> -x -b "<dc_base>" '(objectClass=User)' sAMAccountName
-        # Rule 2: Bind FAILURE is detected ONLY when exit code != 0 AND
-        #         stderr/stdout contains a known hard-error string.
-        #         Exit code 0 == success — output is ALWAYS parsed.
-        #         An empty user list is NOT a bind failure.
-        # Rule 3: Fall back to session credentials ONLY if bind truly failed
-        #         AND credentials are already stored in the session.
-        # Rule 4: NEVER prompt. NEVER block Phase 1 Recon.
         # ─────────────────────────────────────────────────────────────────────
-        # Error strings checked only when exit code != 0.
+        # Bind negotiation
+        # 
+        # No separate probe step. Run the real user query immediately.
+        # Bind failure is detected ONLY from the result of that query:
+        #   - exit code != 0  AND output/stderr contains a hard-error string
+        # Exit code 0 always means the query was accepted — parse regardless.
+        # An empty user list is NOT a bind failure.
+        # NEVER prompt. NEVER block Phase 1 Recon.
+        # ─────────────────────────────────────────────────────────────────────
         BIND_FAILURE_STRINGS = (
             "ldap_bind",
             "invalid credentials",
@@ -326,83 +359,78 @@ class LDAPEnumerationModule:
         )
 
         has_creds = bool(creds.username and (creds.password or creds.ntlm_hash))
-        bind_creds: object = None
-        bind_label: str    = "anonymous"
-        anon_ok            = False
-
-        # Step 1 — Anonymous bind attempt (always, no -D / -w)
-        _info("Attempting anonymous bind (no credentials)...")
-        anon_result = self._run_anon_bind(
-            ldap_host, base_dn, port, use_ldaps, domain=domain
-        )
-        # Exit code 0 always means the query was accepted — parse regardless
-        # of any informational strings that may appear in the output.
-        # Only treat as a real failure when exit code != 0 AND a hard-error
-        # string confirms the bind was actually rejected.
-        if anon_result["exit_code"] == 0:
-            anon_bind_failed = False
-        else:
-            combined = (anon_result["output"] + anon_result["error"]).lower()
-            anon_bind_failed = any(s in combined for s in BIND_FAILURE_STRINGS)
-
-        if not anon_bind_failed:
-            # Bind succeeded — proceed anonymously regardless of user count
-            bind_creds = None
-            bind_label = "anonymous"
-            anon_ok    = True
-            _info("Anonymous bind accepted by DC.")
-        else:
-            _info("Anonymous bind rejected by DC.")
-
-            # Step 2 — Authenticated fallback (only if session creds exist)
-            if has_creds:
-                _info(f"Falling back to session credentials: {creds.username}")
-                bind_creds = creds
-                bind_label = creds.username
-                anon_ok    = False
-                warnings.append(
-                    f"Anonymous bind denied; using session credentials '{creds.username}'."
-                )
-            else:
-                # No session credentials — warn and continue with anonymous anyway.
-                # DC may still allow reads even when the bind technically returned
-                # a non-zero code (some old DCs do this).  Don't block Phase 1.
-                bind_creds = None
-                bind_label = "anonymous"
-                anon_ok    = False
-                warnings.append(
-                    "Anonymous bind returned an error and no session credentials exist. "
-                    "Continuing with anonymous queries — DC may still permit reads."
-                )
+        anon_ok   = False
 
         # ══════════════════════════════════════════════════════════════════
-        # STEP 1 — User enumeration
-        # ldapsearch -H ldap://<dc_ip> -x -b "<base_dn>" '(objectClass=User)' sAMAccountName
+        # STEP 1 — User enumeration (anonymous first)
+        # ldapsearch -H ldap://<target> -x -b "<base_dn>" "(objectClass=User)" sAMAccountName
         # Empty result ≠ failure; raw output is always saved.
         # ══════════════════════════════════════════════════════════════════
         _step_banner(1, "User enumeration via LDAP")
         users:       list[str]  = []
         asrep_users: list[str]  = []
         spn_records: list[dict] = []
-        user_raw_output: str    = ""
+        bind_creds:  object     = None   # anonymous by default
+        bind_label:  str        = "anonymous"
 
         try:
-            user_raw = self._query_users(
-                ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+            _info("Running anonymous user query (no -D / -w)...")
+            anon_qresult = self._query_users_raw(
+                ldap_host, base_dn, port, use_ldaps, creds=None, domain=domain
             )
-            user_raw_output = user_raw
-            user_entries = _parse_ldif_entries(user_raw)
-            users, asrep_users, _, spn_records = _parse_users(user_entries)
-            _info(f"Users found: {len(users)}  |  AS-REP roastable: {len(asrep_users)}")
-            # Always save raw output so the caller can inspect it even when
-            # the parser returns an empty list (e.g. non-standard LDIF layout).
+            user_raw = anon_qresult["output"]
+
+            # Determine bind success from exit code + hard-error strings
+            if anon_qresult["exit_code"] == 0:
+                anon_bind_failed = False
+            else:
+                combined = (user_raw + anon_qresult["error"]).lower()
+                anon_bind_failed = any(s in combined for s in BIND_FAILURE_STRINGS)
+
+            if not anon_bind_failed:
+                anon_ok    = True
+                bind_creds = None
+                bind_label = "anonymous"
+                _info("Anonymous query accepted by DC.")
+            else:
+                _info("Anonymous query rejected by DC.")
+                if has_creds:
+                    _info(f"Falling back to session credentials: {creds.username}")
+                    bind_creds = creds
+                    bind_label = creds.username
+                    warnings.append(
+                        f"Anonymous bind denied; using session credentials '{creds.username}'."
+                    )
+                    auth_qresult = self._query_users_raw(
+                        ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+                    )
+                    user_raw = auth_qresult["output"]
+                else:
+                    # No session creds — keep whatever anonymous returned and continue
+                    warnings.append(
+                        "Anonymous query returned an error and no session credentials exist. "
+                        "Continuing — DC may still permit reads."
+                    )
+
+            # Save raw output unconditionally
             raw_path = self._save_raw_ldap(assessment_id, user_raw)
             _info(f"Raw LDAP output saved → {raw_path}")
+
+            # Parse users directly from 'sAMAccountName:' line prefixes
+            # (robust against non-standard LDIF block layouts)
+            users = _extract_samaccountnames(user_raw)
+
+            # Full LDIF block parse for AS-REP / SPN metadata
+            user_entries = _parse_ldif_entries(user_raw)
+            _, asrep_users, _, spn_records = _parse_users(user_entries)
+
+            _info(f"Users found: {len(users)}  |  AS-REP roastable: {len(asrep_users)}")
             if users:
                 path = self._save_users_ldap(assessment_id, users)
                 _info(f"Users saved → {path}")
             else:
                 _info("No users parsed — raw output retained for manual review.")
+
         except Exception as exc:
             warnings.append(f"Step 1 error: {exc}")
             _info(f"User enumeration failed: {exc}")
@@ -921,7 +949,7 @@ class LDAPEnumerationModule:
         self, target: str, base_dn: str, port: int, use_ldaps: bool,
         creds, domain: str = "",
     ) -> str:
-        """Query all user objects and return raw LDIF output."""
+        """Query all user objects and return raw LDIF output (stdout only)."""
         args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
         args += [
             "-b", base_dn,
@@ -931,6 +959,31 @@ class LDAPEnumerationModule:
         ]
         result = self.executor.run(args)
         return result["output"]
+
+    def _query_users_raw(
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
+    ) -> dict:
+        """
+        Query all user objects and return the full executor result dict.
+
+        Command issued (anonymous example):
+            ldapsearch -H ldap://<target> -x -b "<base_dn>" "(objectClass=User)" sAMAccountName
+
+        Returns dict with keys: exit_code, output, error, status.
+        The caller inspects exit_code and error to determine bind success.
+        """
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
+        args += [
+            "-b", base_dn,
+            "-s", "sub",
+            "(objectClass=User)",
+            "sAMAccountName",
+            "userAccountControl",
+            "description",
+            "servicePrincipalName",
+        ]
+        return self.executor.run(args)
 
     def _query_groups(
         self, target: str, base_dn: str, port: int, use_ldaps: bool,
