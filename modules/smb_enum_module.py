@@ -417,7 +417,9 @@ class SMBEnumerationModule:
         # ── STEP 3: RID Brute-Force ───────────────────────────────────────────
         _step_banner(3, "RID brute-force")
         try:
-            rid_users, rid_groups = self._step_rid_brute(target, creds, raw_log_parts, _info)
+            rid_users, rid_groups = self._step_rid_brute(
+                target, state.domain, creds, raw_log_parts, _info
+            )
             _info(
                 f"Users: {len(rid_users)}  |  Groups: {len(rid_groups)}"
                 + (f"  \u2192  preview: {', '.join(rid_users[:5])}" if rid_users else "")
@@ -573,15 +575,19 @@ class SMBEnumerationModule:
         return _parse_signing(combined)
 
     def _step_rid_brute(
-        self, target: str, creds, raw_log: list[str], _info=None
+        self,
+        target_ip: str,
+        domain: str,
+        creds,
+        raw_log: list[str],
+        _info=None,
     ) -> tuple[list[str], list[str]]:
         """
         Step 3 — RID brute-force via PTY.
 
-        Uses provided credentials if available, otherwise guest.
-        No null session attempt ("-u '' -p ''" is unreliable in nxc).
-        If nxc produces output but no SidType objects are found, displays a
-        clear diagnostic message instead of silently returning empty lists.
+        Tries target_ip first, then domain as fallback.
+        Command: netexec smb <target> -u guest -p '' --rid-brute
+        Uses provided creds if set, otherwise guest.
         """
         import pty
         import select
@@ -648,51 +654,53 @@ class SMBEnumerationModule:
             _warn("netexec / nxc / crackmapexec not found in PATH")
             return [], []
 
-        # Choose credentials: use provided creds if available, otherwise guest
+        # Build auth args
         if creds and creds.username and (creds.password or creds.ntlm_hash):
-            label = f"creds:{creds.username}"
-            # Build exact arg list — no shell, no quoting issues
-            cmd = [cme, "smb", target, "-u", creds.username]
-            if creds.ntlm_hash:
-                cmd += ["-H", creds.ntlm_hash]
-            else:
-                cmd += ["-p", creds.password]
+            label  = f"creds:{creds.username}"
+            auth   = ["-u", creds.username,
+                      "-H", creds.ntlm_hash] if creds.ntlm_hash else [
+                      "-u", creds.username, "-p", creds.password]
         else:
             label = "guest"
-            # Exact match of working manual command:
-            # netexec smb <target> -u 'guest' -p '' --rid-brute
-            cmd = [cme, "smb", target, "-u", "guest", "-p", ""]
+            auth  = ["-u", "guest", "-p", ""]
 
-        cmd += ["--rid-brute"]
+        # Try IP first, then domain — covers both DNS and direct-IP setups
+        targets_to_try: list[tuple[str, str]] = [(target_ip, "IP")]
+        if domain and domain != target_ip:
+            targets_to_try.append((domain, "domain"))
 
-        raw_log.append(f"## Step 3 ({label}): {' '.join(cmd)}")
+        for t, t_label in targets_to_try:
+            cmd = [cme, "smb", t] + auth + ["--rid-brute"]
+            raw_log.append(f"## Step 3 ({label} via {t_label}): {' '.join(cmd)}")
+            _info(f"Running: {' '.join(cmd)}")
 
-        output = ""
-        try:
-            output = _run_pty(cmd, timeout=120)
-        except Exception as exc:
-            raw_log.append(f"## Step 3 PTY error: {exc} — falling back to PIPE")
+            output = ""
             try:
-                res = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
-                output = res["output"] + res["error"]
-            except Exception as exc2:
-                raw_log.append(f"## Step 3 PIPE fallback error: {exc2}")
+                output = _run_pty(cmd, timeout=120)
+            except Exception as exc:
+                raw_log.append(f"## Step 3 PTY error: {exc} — falling back to PIPE")
+                try:
+                    res = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
+                    output = res["output"] + res["error"]
+                except Exception as exc2:
+                    raw_log.append(f"## Step 3 PIPE fallback error: {exc2}")
 
-        raw_log.append(f"## Step 3 output (first 2000 chars):\n{output[:2000]}")
+            raw_log.append(f"## Step 3 ({t_label}) output (first 2000):\n{output[:2000]}")
 
-        if not output.strip():
-            _warn("RID brute returned no output — target may be unreachable")
-            return [], []
+            if not output.strip():
+                _warn(f"RID brute ({t_label}) returned no output")
+                continue
 
-        users, groups = parse_rid_output(output)
+            users, groups = parse_rid_output(output)
+            if users or groups:
+                return users, groups
 
-        if not users and not groups:
             _warn(
-                "RID brute returned no objects — "
+                f"RID brute ({t_label}) returned output but no SidType objects — "
                 "likely restricted or requires authentication"
             )
 
-        return users, groups
+        return [], []
 
 
     def _step_ipc(
