@@ -274,67 +274,61 @@ class LDAPEnumerationModule:
                 "warnings":    list[str],
             }
         """
+        from rich.console import Console as _Con
+        _con = _Con()
+
+        def _info(msg: str) -> None:
+            _con.print(f"  [dim]{msg}[/dim]")
+
+        def _step_banner(n: int, title: str) -> None:
+            _con.print(f"\n  [bold cyan][ Step {n} ][/bold cyan]  {title}")
+
         if not self.executor.check_tool("ldapsearch"):
             return self._error(
                 "ldapsearch is not installed. Run: sudo apt install ldap-utils"
             )
 
-        target   = state.target_ip
-        domain   = state.domain
-        base_dn  = _build_base_dn(domain)
-        creds    = state.initial_credentials
+        target          = state.target_ip
+        domain          = state.domain
+        base_dn         = _build_base_dn(domain)
+        assessment_id   = state.assessment_id
+        creds           = state.initial_credentials
         warnings: list[str] = []
+        policy: dict        = {}
 
-        # Determine which LDAP port(s) to use
+        # Determine LDAP port
         use_ldaps = 636 in state.open_ports
         port      = 636 if use_ldaps else 389
 
-        # ── Step A: Anonymous bind test ────────────────────────────────
-        anon_ok, anon_output, anon_err = self._try_anonymous_bind(
+        # ── Bind negotiation (anon → guest → stored creds → prompt) ───────
+        anon_ok, _, _ = self._try_anonymous_bind(
             target, base_dn, port, use_ldaps, domain=domain
         )
-
-        # ── Step B: Choose query auth mode ────────────────────────────
-        # Bind priority: anonymous → guest (user=guest, pass='') → stored creds → fail
-        has_creds = bool(creds.username and (creds.password or creds.ntlm_hash))
-
-        # Guest-account check: many DCs deny true anonymous bind but accept
-        # guest login with an empty password.  Try it before giving up.
-        guest_ok  = False
+        has_creds  = bool(creds.username and (creds.password or creds.ntlm_hash))
+        guest_ok   = False
         guest_cred = None
+
         if not anon_ok and not has_creds:
             guest_ok = self._try_guest_bind(target, base_dn, port, use_ldaps, domain=domain)
             if guest_ok:
                 from session import Credentials as _Creds
                 guest_cred = _Creds(username="guest", password="")
-                warnings.append(
-                    "Anonymous bind denied; guest account (user=guest, pass='') "
-                    "accepted. Enumerating as guest."
-                )
+                warnings.append("Anonymous bind denied; guest accepted.")
 
         if anon_ok:
-            # True anonymous — most permissive
             bind_creds = None
             bind_label = "anonymous"
         elif guest_ok:
             bind_creds = guest_cred
             bind_label = "guest"
         elif has_creds:
-            # Stored credentials from assessment setup
             bind_creds = creds
-            bind_label = f"{creds.username}"
-            warnings.append(
-                "Anonymous bind was denied; falling back to authenticated queries."
-            )
+            bind_label = creds.username
+            warnings.append("Anonymous bind denied; using stored credentials.")
         else:
-            # ── Interactive credential prompt ──────────────────────────────
-            # Anonymous + guest both failed. Ask the operator for credentials
-            # right now instead of bailing. This supports:
-            #   "ldapsearch ... shandeigh.brana:*9jh}:k" style recon
+            # Interactive prompt — both anonymous and guest failed
             try:
                 from rich.prompt import Prompt
-                from rich.console import Console as _Con
-                _con = _Con()
                 _con.print(
                     "\n  [bold yellow]Anonymous and guest LDAP binds denied.[/bold yellow]\n"
                     "  [dim]Enter credentials to enumerate as an authenticated user.[/dim]\n"
@@ -343,16 +337,11 @@ class LDAPEnumerationModule:
                 _user = Prompt.ask("  [bold bright_cyan]Username[/bold bright_cyan]")
                 if not _user.strip():
                     return {
-                        "status":        "error",
-                        "anonymous":     False,
-                        "ldaps":         use_ldaps,
-                        "users":         [],
-                        "asrep_users":   [],
-                        "groups":        [],
-                        "spns":          [],
-                        "desc_findings": [],
-                        "error":         "LDAP cancelled — no credentials provided.",
-                        "warnings":      warnings,
+                        "status": "error", "anonymous": False, "ldaps": use_ldaps,
+                        "users": [], "asrep_users": [], "groups": [], "spns": [],
+                        "desc_findings": [], "valid_creds": [],
+                        "error": "LDAP cancelled — no credentials provided.",
+                        "warnings": warnings,
                     }
                 _pass = Prompt.ask(
                     "  [bold bright_cyan]Password[/bold bright_cyan]",
@@ -361,66 +350,156 @@ class LDAPEnumerationModule:
                 from session import Credentials as _Creds
                 bind_creds = _Creds(username=_user.strip(), password=_pass)
                 bind_label = _user.strip()
-                # Persist in state so other modules can reuse them
                 state.initial_credentials = bind_creds
-                warnings.append(
-                    f"Using interactively-entered credentials: {bind_label}"
-                )
+                warnings.append(f"Using interactively-entered credentials: {bind_label}")
             except Exception:
                 return {
-                    "status":        "error",
-                    "anonymous":     False,
-                    "ldaps":         use_ldaps,
-                    "users":         [],
-                    "asrep_users":   [],
-                    "groups":        [],
-                    "spns":          [],
-                    "desc_findings": [],
-                    "error": (
-                        "LDAP bind failed: anonymous denied, guest rejected, "
-                        "no credentials available."
-                    ),
-                    "warnings":      warnings,
+                    "status": "error", "anonymous": False, "ldaps": use_ldaps,
+                    "users": [], "asrep_users": [], "groups": [], "spns": [],
+                    "desc_findings": [], "valid_creds": [],
+                    "error": "LDAP bind failed: anonymous denied, guest rejected, no credentials.",
+                    "warnings": warnings,
                 }
 
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 1 — User enumeration
+        # ldapsearch -H ldap://<domain> -x -b "<base_dn>" '(objectClass=User)' sAMAccountName
+        # ══════════════════════════════════════════════════════════════════
+        _step_banner(1, "User enumeration via LDAP")
+        users:       list[str]  = []
+        asrep_users: list[str]  = []
+        spn_records: list[dict] = []
 
-        user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
-        group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
-        spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+        try:
+            user_raw = self._query_users(
+                target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+            )
+            user_entries = _parse_ldif_entries(user_raw)
+            users, asrep_users, _, spn_records = _parse_users(user_entries)
+            _info(f"Users found: {len(users)}  |  AS-REP roastable: {len(asrep_users)}")
+            if users:
+                path = self._save_users_ldap(assessment_id, users)
+                _info(f"Saved → {path}")
+        except Exception as exc:
+            warnings.append(f"Step 1 error: {exc}")
+            _info(f"User enumeration failed: {exc}")
 
-        # ── Step C: Parse results ──────────────────────────────────────
-        user_entries  = _parse_ldif_entries(user_raw)
-        group_entries = _parse_ldif_entries(group_raw)
-        spn_entries   = _parse_ldif_entries(spn_raw)
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 2 — Description scan for credentials
+        # ldapsearch ... '(objectClass=User)' sAMAccountName description
+        # ══════════════════════════════════════════════════════════════════
+        _step_banner(2, "Description scan for embedded credentials")
+        desc_findings: list[dict] = []
 
-        users, asrep_users, desc_findings, spn_records = _parse_users(user_entries)
+        try:
+            desc_raw = self._query_descriptions(
+                target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+            )
+            desc_entries  = _parse_ldif_entries(desc_raw)
+            _, _, desc_findings, _ = _parse_users(desc_entries)
+            _info(f"Suspicious descriptions found: {len(desc_findings)}")
+            if desc_findings:
+                path = self._save_creds_from_ldap(assessment_id, desc_findings)
+                _info(f"Saved → {path}")
+                for f in desc_findings:
+                    _info(f"  [{f['username']}] {f['description']}")
+        except Exception as exc:
+            warnings.append(f"Step 2 error: {exc}")
+            _info(f"Description scan failed: {exc}")
 
-        # Also parse SPNs from the dedicated SPN query (may overlap; deduplicate)
-        _, _, _, extra_spns = _parse_users(spn_entries)
-        seen_spns = {(r["username"], r["spn"]) for r in spn_records}
-        for spn in extra_spns:
-            key = (spn["username"], spn["spn"])
-            if key not in seen_spns:
-                spn_records.append(spn)
-                seen_spns.add(key)
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 3 — Validate credentials found in descriptions
+        # netexec smb <target_ip> -u <user> -p <pass> --users
+        # ══════════════════════════════════════════════════════════════════
+        _step_banner(3, "Credential validation via netexec")
+        valid_creds: list[dict] = []
 
-        groups = _parse_groups(group_entries)
+        if desc_findings:
+            for finding in desc_findings:
+                username    = finding["username"]
+                description = finding["description"]
+                # Attempt to extract a password-like token from the description
+                candidates = self._extract_password_candidates(description)
+                for candidate in candidates:
+                    result = self._validate_credential(target, username, candidate)
+                    if result == "valid":
+                        _info(f"  [green]✔  VALID[/green]  {username}:{candidate}")
+                        valid_creds.append({"username": username, "password": candidate})
+                    elif result == "must_change":
+                        _info(
+                            f"  [yellow]⚠  TEMP PASS[/yellow]  {username}:{candidate}  "
+                            "— Password is temporary. Use smbpasswd to change."
+                        )
+                        valid_creds.append({
+                            "username": username, "password": candidate,
+                            "note": "Password must be changed (temporary)"
+                        })
+                    else:
+                        _info(f"  [red]✘  invalid[/red]  {username}:{candidate}")
 
-        # ── Step D: Password policy ────────────────────────────────────
-        policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
-        if policy:
-            state.password_policy = policy
+            if valid_creds:
+                path = self._save_valid_creds(assessment_id, valid_creds)
+                _info(f"Valid credentials saved → {path}")
+                # Persist first valid set as stored creds for subsequent modules
+                if not state.initial_credentials.username:
+                    vc = valid_creds[0]
+                    from session import Credentials as _Creds
+                    state.initial_credentials = _Creds(
+                        username=vc["username"], password=vc["password"]
+                    )
+            else:
+                _info("No credentials validated from descriptions.")
+        else:
+            _info("No suspicious descriptions — skipping validation.")
 
-        # ── Step E: ldapdomaindump (when creds available) ─────────────
-        if bind_creds and bind_creds.username:
-            dump_path = self._run_ldapdomaindump(target, domain, bind_creds)
-            if dump_path:
-                state.domain_dump_path = dump_path
-                warnings.append(f"ldapdomaindump output saved to: {dump_path}")
+        # ── Additional enumeration ─────────────────────────────────────────
+        # Groups, SPNs from dedicated query, password policy, ldapdomaindump
+        groups: list[str] = []
+        try:
+            group_raw    = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            group_entries = _parse_ldif_entries(group_raw)
+            groups = _parse_groups(group_entries)
+        except Exception as exc:
+            warnings.append(f"Group enumeration error: {exc}")
 
-        # ── Step F: Update AssessmentState ────────────────────────────
+        try:
+            spn_raw = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            spn_entries = _parse_ldif_entries(spn_raw)
+            _, _, _, extra_spns = _parse_users(spn_entries)
+            seen = {(r["username"], r["spn"]) for r in spn_records}
+            for s in extra_spns:
+                if (s["username"], s["spn"]) not in seen:
+                    spn_records.append(s)
+                    seen.add((s["username"], s["spn"]))
+        except Exception as exc:
+            warnings.append(f"SPN enumeration error: {exc}")
+
+        try:
+            policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            if policy:
+                state.password_policy = policy
+        except Exception as exc:
+            warnings.append(f"Password policy error: {exc}")
+
+        try:
+            if bind_creds and bind_creds.username:
+                dump_path = self._run_ldapdomaindump(target, domain, bind_creds)
+                if dump_path:
+                    state.domain_dump_path = dump_path
+                    warnings.append(f"ldapdomaindump → {dump_path}")
+        except Exception as exc:
+            warnings.append(f"ldapdomaindump error: {exc}")
+
+        # ── State update ───────────────────────────────────────────────────
         self._update_state(state, target, users, asrep_users, groups,
                            spn_records, desc_findings, anon_ok, warnings)
+
+        # Persist valid creds in state
+        for vc in valid_creds:
+            entry = {"username": vc["username"], "password": vc.get("password", ""),
+                     "source": "ldap_description"}
+            if entry not in state.valid_credentials:
+                state.valid_credentials.append(entry)
 
         return {
             "status":           "success",
@@ -431,13 +510,151 @@ class LDAPEnumerationModule:
             "groups":           groups,
             "spns":             spn_records,
             "desc_findings":    desc_findings,
+            "valid_creds":      valid_creds,
             "password_policy":  policy,
-            "domain_dump_path": state.domain_dump_path,
+            "domain_dump_path": getattr(state, "domain_dump_path", None),
             "error":            None,
             "warnings":         warnings,
         }
 
     # ------------------------------------------------------------------ #
+    #  Artifact helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _report_dir(self, assessment_id: str) -> str:
+        path = os.path.join("reports", assessment_id)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _save_users_ldap(self, assessment_id: str, users: list[str]) -> str:
+        """Save enumerated usernames to reports/<assessment_id>/users_ldap.txt."""
+        dirpath  = self._report_dir(assessment_id)
+        filepath = os.path.join(dirpath, "users_ldap.txt")
+        with open(filepath, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(u.strip() for u in users if u.strip()))
+            fh.write("\n")
+        return filepath
+
+    def _save_creds_from_ldap(self, assessment_id: str, findings: list[dict]) -> str:
+        """Save username:description pairs to reports/<assessment_id>/creds_from_ldap.txt."""
+        dirpath  = self._report_dir(assessment_id)
+        filepath = os.path.join(dirpath, "creds_from_ldap.txt")
+        with open(filepath, "w", encoding="utf-8") as fh:
+            for f in findings:
+                fh.write(f"{f['username']}  |  {f['description']}\n")
+        return filepath
+
+    def _save_valid_creds(self, assessment_id: str, valid: list[dict]) -> str:
+        """Save validated credentials to reports/<assessment_id>/valid_credentials.txt."""
+        dirpath  = self._report_dir(assessment_id)
+        filepath = os.path.join(dirpath, "valid_credentials.txt")
+        with open(filepath, "w", encoding="utf-8") as fh:
+            for v in valid:
+                note = f"  [{v['note']}]" if v.get("note") else ""
+                fh.write(f"{v['username']}:{v['password']}{note}\n")
+        return filepath
+
+    # ------------------------------------------------------------------ #
+    #  Credential validation                                               #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _extract_password_candidates(description: str) -> list[str]:
+        """
+        Heuristically extract password-like tokens from a description string.
+        Looks for standalone words that resemble passwords (non-trivial length,
+        mixed characters, or follow known patterns like Word+Digits).
+        """
+        import re as _re
+        candidates: list[str] = []
+        # Split on whitespace and common separators
+        tokens = _re.split(r"[\s:=,;|]+", description)
+        for token in tokens:
+            t = token.strip().strip("\"'")
+            # Skip too-short, empty, or all-lowercase common words
+            if len(t) < 4:
+                continue
+            # Must contain at least one letter (not just numbers/symbols)
+            if not any(c.isalpha() for c in t):
+                continue
+            # Skip tokens that look like attribute names
+            if t.lower() in {"pass", "password", "pwd", "creds", "credentials",
+                              "temp", "temporary", "welcome", "default", "secret",
+                              "change"}:
+                continue
+            candidates.append(t)
+        return candidates
+
+    def _validate_credential(self, target: str, username: str, password: str) -> str:
+        """
+        Validate a username/password pair against the target via:
+            netexec smb <target> -u <user> -p <password> --users
+
+        Returns:
+            "valid"       — authentication succeeded
+            "must_change" — auth OK but password must be changed
+            "invalid"     — authentication failed
+        """
+        import subprocess as _sp
+        import shutil
+
+        cme = None
+        for binary in ("netexec", "nxc", "crackmapexec"):
+            if shutil.which(binary):
+                cme = binary
+                break
+        if not cme:
+            return "invalid"
+
+        cmd = [cme, "smb", target, "-u", username, "-p", password, "--users"]
+        try:
+            result = _sp.run(
+                cmd,
+                stdout=_sp.PIPE,
+                stderr=_sp.PIPE,
+                timeout=30,
+            )
+            output = (result.stdout or b"").decode("utf-8", errors="replace")
+            output += (result.stderr or b"").decode("utf-8", errors="replace")
+        except Exception:
+            return "invalid"
+
+        out_lower = output.lower()
+
+        if "password must be changed" in out_lower or "must change password" in out_lower:
+            return "must_change"
+
+        # netexec marks success with [+]
+        if "[+]" in output:
+            return "valid"
+
+        return "invalid"
+
+    # ------------------------------------------------------------------ #
+    #  ldapsearch — description query                                      #
+    # ------------------------------------------------------------------ #
+
+    def _query_descriptions(
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
+    ) -> str:
+        """Query user objects requesting both sAMAccountName and description."""
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
+        args += [
+            "-b", base_dn,
+            "-s", "sub",
+            "(objectClass=user)",
+            "sAMAccountName",
+            "description",
+            "userAccountControl",
+        ]
+        result = self.executor.run(args)
+        return result["output"]
+
+    # ------------------------------------------------------------------ #
+    #  State mutation                                                      #
+    # ------------------------------------------------------------------ #
+
     #  State mutation                                                       #
     # ------------------------------------------------------------------ #
 
