@@ -6,23 +6,26 @@ ldapsearch (anonymous + authenticated), with graceful fallback when the
 tool is unavailable.
 
 Enumeration steps:
-    A) Anonymous bind test  — determines whether the DC allows unauthenticated
-       LDAP queries (ports 389 / 636).
-    B) User enumeration     — extracts sAMAccountName, description, and the
+    A) Anonymous bind test  — ALWAYS attempted first (no -D / -W).
+       Exact command: ldapsearch -H ldap://<domain> -x -b "<dc_base>"
+    B) Authenticated fallback — used ONLY if anonymous fails AND session
+       credentials already exist.  Never prompts the user for credentials.
+    C) User enumeration     — extracts sAMAccountName, description, and the
        userAccountControl bitmask from all user objects.
-    C) AS-REP detection     — flags accounts with the DONT_REQUIRE_PREAUTH
+    D) AS-REP detection     — flags accounts with the DONT_REQUIRE_PREAUTH
        bit set (0x400000), indicating they are roastable without credentials.
-    D) Description scanning — applies regex patterns to description fields to
+    E) Description scanning — applies regex patterns to description fields to
        detect cleartext or weakly-obfuscated credentials.
-    E) SPN discovery        — queries servicePrincipalName to identify
+    F) SPN discovery        — queries servicePrincipalName to identify
        Kerberoastable service accounts.
-    F) Group enumeration    — lists AD groups for context.
+    G) Group enumeration    — lists AD groups for context.
 
 Design contract:
     - Zero CLI output — all results returned as a structured dict.
     - Caller (main.py) is responsible for all display/formatting.
     - state is updated in-place; caller is responsible for saving the session.
     - CommandExecutor is used exclusively (no shell=True anywhere).
+    - NO credential prompts during Phase 1 Recon.
 
 Tools used:
     - ldapsearch   (required — part of ldap-utils: apt install ldap-utils)
@@ -304,75 +307,51 @@ class LDAPEnumerationModule:
         port      = 636 if use_ldaps else 389
 
         # ── Bind negotiation ──────────────────────────────────────────────────
-        # Fix: many DCs deny root-DSE queries but allow anonymous subtree reads.
-        # Test by running the ACTUAL user query with no credentials; if we get
-        # results → anonymous works.  Only prompt as absolute last resort.
+        # Rule 1: ALWAYS attempt anonymous bind first — no -D / -W flags.
+        #         ldapsearch -H ldap://<domain> -x -b "<dc_base>"
+        # Rule 2: Only fall back to session credentials if anonymous fails
+        #         AND credentials are already stored in the session.
+        # Rule 3: NEVER prompt the user for credentials during Phase 1 Recon.
         # ─────────────────────────────────────────────────────────────────────
         has_creds = bool(creds.username and (creds.password or creds.ntlm_hash))
         bind_creds: object = None
         bind_label: str    = "anonymous"
         anon_ok            = False
 
-        if has_creds:
-            # Stored credentials from session setup — use immediately
-            bind_creds = creds
-            bind_label = creds.username
-            anon_ok    = False
+        # Step 1 — Anonymous bind (always tried first, regardless of session creds)
+        _info("Attempting anonymous bind (no credentials)...")
+        anon_raw = self._query_users(
+            ldap_host, base_dn, port, use_ldaps, creds=None, domain=domain
+        )
+        if anon_raw.strip() and "sAMAccountName" in anon_raw:
+            bind_creds = None
+            bind_label = "anonymous"
+            anon_ok    = True
+            _info("Anonymous bind succeeded.")
         else:
-            # Try anonymous first (what the user's playbook does — no -D/-w)
-            test_raw = self._query_users(
-                ldap_host, base_dn, port, use_ldaps, creds=None, domain=domain
-            )
-            if test_raw.strip() and "sAMAccountName" in test_raw:
-                bind_creds = None
-                bind_label = "anonymous"
-                anon_ok    = True
-            else:
-                # Try guest
-                from session import Credentials as _Creds
-                _guest = _Creds(username="guest", password="")
-                guest_raw = self._query_users(
-                    ldap_host, base_dn, port, use_ldaps, creds=_guest, domain=domain
+            _info("Anonymous bind returned no data.")
+
+            # Step 2 — Authenticated fallback (only if session creds exist)
+            if has_creds:
+                _info(f"Falling back to session credentials: {creds.username}")
+                bind_creds = creds
+                bind_label = creds.username
+                anon_ok    = False
+                warnings.append(
+                    f"Anonymous bind denied; using session credentials '{creds.username}'."
                 )
-                if guest_raw.strip() and "sAMAccountName" in guest_raw:
-                    bind_creds = _guest
-                    bind_label = "guest"
-                    anon_ok    = False
-                    warnings.append("Anonymous bind denied; guest accepted.")
-                else:
-                    # Last resort — interactive prompt
-                    try:
-                        from rich.prompt import Prompt
-                        _con.print(
-                            "\n  [bold yellow]Anonymous and guest LDAP queries returned no data.[/bold yellow]\n"
-                            "  [dim]Enter credentials to enumerate as an authenticated user.[/dim]\n"
-                            "  [dim](Leave username blank to cancel.)[/dim]"
-                        )
-                        _user = Prompt.ask("  [bold bright_cyan]Username[/bold bright_cyan]")
-                        if not _user.strip():
-                            return {
-                                "status": "error", "anonymous": False, "ldaps": use_ldaps,
-                                "users": [], "asrep_users": [], "groups": [], "spns": [],
-                                "desc_findings": [], "valid_creds": [],
-                                "error": "LDAP cancelled — no credentials provided.",
-                                "warnings": warnings,
-                            }
-                        _pass = Prompt.ask(
-                            "  [bold bright_cyan]Password[/bold bright_cyan]",
-                            password=True,
-                        )
-                        bind_creds = _Creds(username=_user.strip(), password=_pass)
-                        bind_label = _user.strip()
-                        state.initial_credentials = bind_creds
-                        warnings.append(f"Using interactively-entered credentials: {bind_label}")
-                    except Exception:
-                        return {
-                            "status": "error", "anonymous": False, "ldaps": use_ldaps,
-                            "users": [], "asrep_users": [], "groups": [], "spns": [],
-                            "desc_findings": [], "valid_creds": [],
-                            "error": "LDAP bind failed: anonymous denied, guest rejected, no credentials.",
-                            "warnings": warnings,
-                        }
+            else:
+                # No session credentials — do not prompt; fail gracefully.
+                return {
+                    "status": "error", "anonymous": False, "ldaps": use_ldaps,
+                    "users": [], "asrep_users": [], "groups": [], "spns": [],
+                    "desc_findings": [], "valid_creds": [],
+                    "error": (
+                        "LDAP anonymous bind failed and no session credentials are available. "
+                        "Provide credentials via session setup before running LDAP enumeration."
+                    ),
+                    "warnings": warnings,
+                }
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 1 — User enumeration
