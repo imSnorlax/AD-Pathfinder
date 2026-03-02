@@ -296,70 +296,83 @@ class LDAPEnumerationModule:
         warnings: list[str] = []
         policy: dict        = {}
 
-        # Determine LDAP port
+        # Use domain name in LDAP URI (matches user's working command:
+        #   ldapsearch -H ldap://VulnAD.ma -x -b "DC=..." ...)
+        # Falls back to IP if domain not set.
+        ldap_host = domain if domain else target
         use_ldaps = 636 in state.open_ports
         port      = 636 if use_ldaps else 389
 
-        # ── Bind negotiation (anon → guest → stored creds → prompt) ───────
-        anon_ok, _, _ = self._try_anonymous_bind(
-            target, base_dn, port, use_ldaps, domain=domain
-        )
-        has_creds  = bool(creds.username and (creds.password or creds.ntlm_hash))
-        guest_ok   = False
-        guest_cred = None
+        # ── Bind negotiation ──────────────────────────────────────────────────
+        # Fix: many DCs deny root-DSE queries but allow anonymous subtree reads.
+        # Test by running the ACTUAL user query with no credentials; if we get
+        # results → anonymous works.  Only prompt as absolute last resort.
+        # ─────────────────────────────────────────────────────────────────────
+        has_creds = bool(creds.username and (creds.password or creds.ntlm_hash))
+        bind_creds: object = None
+        bind_label: str    = "anonymous"
+        anon_ok            = False
 
-        if not anon_ok and not has_creds:
-            guest_ok = self._try_guest_bind(target, base_dn, port, use_ldaps, domain=domain)
-            if guest_ok:
-                from session import Credentials as _Creds
-                guest_cred = _Creds(username="guest", password="")
-                warnings.append("Anonymous bind denied; guest accepted.")
-
-        if anon_ok:
-            bind_creds = None
-            bind_label = "anonymous"
-        elif guest_ok:
-            bind_creds = guest_cred
-            bind_label = "guest"
-        elif has_creds:
+        if has_creds:
+            # Stored credentials from session setup — use immediately
             bind_creds = creds
             bind_label = creds.username
-            warnings.append("Anonymous bind denied; using stored credentials.")
+            anon_ok    = False
         else:
-            # Interactive prompt — both anonymous and guest failed
-            try:
-                from rich.prompt import Prompt
-                _con.print(
-                    "\n  [bold yellow]Anonymous and guest LDAP binds denied.[/bold yellow]\n"
-                    "  [dim]Enter credentials to enumerate as an authenticated user.[/dim]\n"
-                    "  [dim](Leave username blank to cancel.)[/dim]"
-                )
-                _user = Prompt.ask("  [bold bright_cyan]Username[/bold bright_cyan]")
-                if not _user.strip():
-                    return {
-                        "status": "error", "anonymous": False, "ldaps": use_ldaps,
-                        "users": [], "asrep_users": [], "groups": [], "spns": [],
-                        "desc_findings": [], "valid_creds": [],
-                        "error": "LDAP cancelled — no credentials provided.",
-                        "warnings": warnings,
-                    }
-                _pass = Prompt.ask(
-                    "  [bold bright_cyan]Password[/bold bright_cyan]",
-                    password=True,
-                )
+            # Try anonymous first (what the user's playbook does — no -D/-w)
+            test_raw = self._query_users(
+                ldap_host, base_dn, port, use_ldaps, creds=None, domain=domain
+            )
+            if test_raw.strip() and "sAMAccountName" in test_raw:
+                bind_creds = None
+                bind_label = "anonymous"
+                anon_ok    = True
+            else:
+                # Try guest
                 from session import Credentials as _Creds
-                bind_creds = _Creds(username=_user.strip(), password=_pass)
-                bind_label = _user.strip()
-                state.initial_credentials = bind_creds
-                warnings.append(f"Using interactively-entered credentials: {bind_label}")
-            except Exception:
-                return {
-                    "status": "error", "anonymous": False, "ldaps": use_ldaps,
-                    "users": [], "asrep_users": [], "groups": [], "spns": [],
-                    "desc_findings": [], "valid_creds": [],
-                    "error": "LDAP bind failed: anonymous denied, guest rejected, no credentials.",
-                    "warnings": warnings,
-                }
+                _guest = _Creds(username="guest", password="")
+                guest_raw = self._query_users(
+                    ldap_host, base_dn, port, use_ldaps, creds=_guest, domain=domain
+                )
+                if guest_raw.strip() and "sAMAccountName" in guest_raw:
+                    bind_creds = _guest
+                    bind_label = "guest"
+                    anon_ok    = False
+                    warnings.append("Anonymous bind denied; guest accepted.")
+                else:
+                    # Last resort — interactive prompt
+                    try:
+                        from rich.prompt import Prompt
+                        _con.print(
+                            "\n  [bold yellow]Anonymous and guest LDAP queries returned no data.[/bold yellow]\n"
+                            "  [dim]Enter credentials to enumerate as an authenticated user.[/dim]\n"
+                            "  [dim](Leave username blank to cancel.)[/dim]"
+                        )
+                        _user = Prompt.ask("  [bold bright_cyan]Username[/bold bright_cyan]")
+                        if not _user.strip():
+                            return {
+                                "status": "error", "anonymous": False, "ldaps": use_ldaps,
+                                "users": [], "asrep_users": [], "groups": [], "spns": [],
+                                "desc_findings": [], "valid_creds": [],
+                                "error": "LDAP cancelled — no credentials provided.",
+                                "warnings": warnings,
+                            }
+                        _pass = Prompt.ask(
+                            "  [bold bright_cyan]Password[/bold bright_cyan]",
+                            password=True,
+                        )
+                        bind_creds = _Creds(username=_user.strip(), password=_pass)
+                        bind_label = _user.strip()
+                        state.initial_credentials = bind_creds
+                        warnings.append(f"Using interactively-entered credentials: {bind_label}")
+                    except Exception:
+                        return {
+                            "status": "error", "anonymous": False, "ldaps": use_ldaps,
+                            "users": [], "asrep_users": [], "groups": [], "spns": [],
+                            "desc_findings": [], "valid_creds": [],
+                            "error": "LDAP bind failed: anonymous denied, guest rejected, no credentials.",
+                            "warnings": warnings,
+                        }
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 1 — User enumeration
@@ -372,7 +385,7 @@ class LDAPEnumerationModule:
 
         try:
             user_raw = self._query_users(
-                target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+                ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
             )
             user_entries = _parse_ldif_entries(user_raw)
             users, asrep_users, _, spn_records = _parse_users(user_entries)
@@ -393,7 +406,7 @@ class LDAPEnumerationModule:
 
         try:
             desc_raw = self._query_descriptions(
-                target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+                ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
             )
             desc_entries  = _parse_ldif_entries(desc_raw)
             _, _, desc_findings, _ = _parse_users(desc_entries)
@@ -426,13 +439,16 @@ class LDAPEnumerationModule:
                         _info(f"  [green]✔  VALID[/green]  {username}:{candidate}")
                         valid_creds.append({"username": username, "password": candidate})
                     elif result == "must_change":
-                        _info(
-                            f"  [yellow]⚠  TEMP PASS[/yellow]  {username}:{candidate}  "
-                            "— Password is temporary. Use smbpasswd to change."
+                        _con.print(
+                            f"\n  [yellow bold]⚠  TEMPORARY PASSWORD[/yellow bold]  "
+                            f"[cyan]{username}[/cyan]:[cyan]{candidate}[/cyan]\n"
+                            f"  [dim]The password is temporary and must be changed before use.[/dim]\n"
+                            f"  [dim]Run:[/dim] [bold]smbpasswd -r {domain} -U {username}[/bold]\n"
+                            f"  [dim]Then retry:[/dim] [bold]netexec smb {target} -u '{username}' -p '<new_pass>' --users[/bold]"
                         )
                         valid_creds.append({
                             "username": username, "password": candidate,
-                            "note": "Password must be changed (temporary)"
+                            "note": f"Temporary — change via: smbpasswd -r {domain} -U {username}"
                         })
                     else:
                         _info(f"  [red]✘  invalid[/red]  {username}:{candidate}")
@@ -456,14 +472,14 @@ class LDAPEnumerationModule:
         # Groups, SPNs from dedicated query, password policy, ldapdomaindump
         groups: list[str] = []
         try:
-            group_raw    = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            group_raw    = self._query_groups(ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
             group_entries = _parse_ldif_entries(group_raw)
             groups = _parse_groups(group_entries)
         except Exception as exc:
             warnings.append(f"Group enumeration error: {exc}")
 
         try:
-            spn_raw = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            spn_raw = self._query_spns(ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
             spn_entries = _parse_ldif_entries(spn_raw)
             _, _, _, extra_spns = _parse_users(spn_entries)
             seen = {(r["username"], r["spn"]) for r in spn_records}
@@ -475,7 +491,7 @@ class LDAPEnumerationModule:
             warnings.append(f"SPN enumeration error: {exc}")
 
         try:
-            policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+            policy = self._query_password_policy(ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
             if policy:
                 state.password_policy = policy
         except Exception as exc:
