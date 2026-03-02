@@ -644,27 +644,25 @@ class SMBEnumerationModule:
 
         cme = self._find_cme()
         if not cme:
-            raw_log.append("## Step 3: no nxc/crackmapexec binary found")
-            _warn("nxc/crackmapexec not found in PATH")
+            raw_log.append("## Step 3: netexec/nxc not found in PATH")
+            _warn("netexec / nxc / crackmapexec not found in PATH")
             return [], []
 
-        # Choose credentials: use provided if available, else guest
+        # Choose credentials: use provided creds if available, otherwise guest
         if creds and creds.username and (creds.password or creds.ntlm_hash):
-            auth_u = creds.username
-            auth_p = creds.password
-            auth_h = creds.ntlm_hash
-            label  = f"as {auth_u}"
+            label = f"creds:{creds.username}"
+            # Build exact arg list — no shell, no quoting issues
+            cmd = [cme, "smb", target, "-u", creds.username]
+            if creds.ntlm_hash:
+                cmd += ["-H", creds.ntlm_hash]
+            else:
+                cmd += ["-p", creds.password]
         else:
-            auth_u = "guest"
-            auth_p = ""
-            auth_h = ""
-            label  = "guest"
+            label = "guest"
+            # Exact match of working manual command:
+            # netexec smb <target> -u 'guest' -p '' --rid-brute
+            cmd = [cme, "smb", target, "-u", "guest", "-p", ""]
 
-        cmd = [cme, "smb", target, "-u", auth_u]
-        if auth_h:
-            cmd += ["-H", auth_h]
-        else:
-            cmd += ["-p", auth_p]
         cmd += ["--rid-brute"]
 
         raw_log.append(f"## Step 3 ({label}): {' '.join(cmd)}")
@@ -820,8 +818,8 @@ class SMBEnumerationModule:
     # ------------------------------------------------------------------ #
 
     def _find_cme(self) -> Optional[str]:
-        """Return the first available nxc/crackmapexec binary name, or None."""
-        for binary in ("nxc", "crackmapexec", "cme"):
+        """Return the first available netexec/nxc/crackmapexec binary, or None."""
+        for binary in ("netexec", "nxc", "crackmapexec", "cme"):
             if self._quiet_exec.check_tool(binary):
                 return binary
         return None
