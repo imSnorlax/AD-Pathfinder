@@ -299,25 +299,24 @@ class LDAPEnumerationModule:
         warnings: list[str] = []
         policy: dict        = {}
 
-        # Use domain name in LDAP URI (matches user's working command:
-        #   ldapsearch -H ldap://VulnAD.ma -x -b "DC=..." ...)
-        # Falls back to IP if domain not set.
-        ldap_host = domain if domain else target
+        # Always connect via the DC IP address for ldapsearch -H.
+        # Base DN is still built from the domain name (DC=VulnAD,DC=ma etc.).
+        ldap_host = target
         use_ldaps = 636 in state.open_ports
         port      = 636 if use_ldaps else 389
 
         # ── Bind negotiation ──────────────────────────────────────────────────
         # Rule 1: ALWAYS attempt anonymous bind first — no -D / -W flags.
-        #         ldapsearch -H ldap://<domain> -x -b "<dc_base>" '(objectClass=User)' sAMAccountName
-        # Rule 2: Bind FAILURE is detected ONLY by:
-        #           - exit code != 0, OR
-        #           - output/stderr containing a known error string.
+        #         ldapsearch -H ldap://<dc_ip> -x -b "<dc_base>" '(objectClass=User)' sAMAccountName
+        # Rule 2: Bind FAILURE is detected ONLY when exit code != 0 AND
+        #         stderr/stdout contains a known hard-error string.
+        #         Exit code 0 == success — output is ALWAYS parsed.
         #         An empty user list is NOT a bind failure.
         # Rule 3: Fall back to session credentials ONLY if bind truly failed
         #         AND credentials are already stored in the session.
         # Rule 4: NEVER prompt. NEVER block Phase 1 Recon.
         # ─────────────────────────────────────────────────────────────────────
-        # Error strings that definitively indicate an LDAP bind failure.
+        # Error strings checked only when exit code != 0.
         BIND_FAILURE_STRINGS = (
             "ldap_bind",
             "invalid credentials",
@@ -336,13 +335,15 @@ class LDAPEnumerationModule:
         anon_result = self._run_anon_bind(
             ldap_host, base_dn, port, use_ldaps, domain=domain
         )
-        anon_bind_failed = (
-            anon_result["exit_code"] != 0
-            or any(
-                s in (anon_result["output"] + anon_result["error"]).lower()
-                for s in BIND_FAILURE_STRINGS
-            )
-        )
+        # Exit code 0 always means the query was accepted — parse regardless
+        # of any informational strings that may appear in the output.
+        # Only treat as a real failure when exit code != 0 AND a hard-error
+        # string confirms the bind was actually rejected.
+        if anon_result["exit_code"] == 0:
+            anon_bind_failed = False
+        else:
+            combined = (anon_result["output"] + anon_result["error"]).lower()
+            anon_bind_failed = any(s in combined for s in BIND_FAILURE_STRINGS)
 
         if not anon_bind_failed:
             # Bind succeeded — proceed anonymously regardless of user count
@@ -376,7 +377,7 @@ class LDAPEnumerationModule:
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 1 — User enumeration
-        # ldapsearch -H ldap://<domain> -x -b "<base_dn>" '(objectClass=User)' sAMAccountName
+        # ldapsearch -H ldap://<dc_ip> -x -b "<base_dn>" '(objectClass=User)' sAMAccountName
         # Empty result ≠ failure; raw output is always saved.
         # ══════════════════════════════════════════════════════════════════
         _step_banner(1, "User enumeration via LDAP")
