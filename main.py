@@ -919,28 +919,38 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             # can just pick a number instead of typing them out.
             from session import Credentials as _Creds
 
-            _cred_pool: list[tuple[str, str]] = []   # (username, password)
+            _cred_pool: list[tuple[str, str, str]] = []   # (username, password, source)
 
             # 1. Description creds found during LDAP enum
             for _df in getattr(state, "desc_findings", []):
                 _u = _df.get("username", "")
                 _p = _df.get("description", "")   # raw description contains the cred
                 if _u and _p:
-                    _cred_pool.append((_u, _p))
+                    _cred_pool.append((_u, _p, "desc"))
 
             # 2. Valid creds confirmed by spraying / validation
             for _vc in getattr(state, "valid_credentials", []):
                 _u = _vc.get("username", "")
                 _p = _vc.get("password", _vc.get("ntlm_hash", ""))
-                if _u and _p and (_u, _p) not in _cred_pool:
-                    _cred_pool.append((_u, _p))
+                if _u and _p and not any(c[0] == _u and c[1] == _p for c in _cred_pool):
+                    _cred_pool.append((_u, _p, "spray"))
 
-            # 3. Initial credentials (if they have a password set)
+            # 3. Initial credentials (if non-guest with a password set)
             _ic = state.initial_credentials
             if _ic and _ic.username and (_ic.password or _ic.ntlm_hash):
                 _p = _ic.password or _ic.ntlm_hash
-                if (_ic.username, _p) not in _cred_pool:
-                    _cred_pool.append((_ic.username, _p))
+                if not any(c[0] == _ic.username and c[1] == _p for c in _cred_pool):
+                    _cred_pool.append((_ic.username, _p, "session"))
+
+            # 4. Usernames from captured hashes (AS-REP / TGS) — password needed
+            # Cracking is done offline; we just pre-fill the username so the user
+            # only has to type their cracked password, not the full username.
+            _hash_users: list[str] = []
+            for _h in getattr(state, "hashes", []):
+                _hu = _h.get("username", "")
+                if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in _hash_users:
+                    _hash_users.append(_hu)
+
 
             # ── Display known creds if any ──────────────────────────────
             console.print()
@@ -950,7 +960,7 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             _selected_user = ""
             _selected_pass = ""
 
-            if _cred_pool:
+            if _cred_pool or _hash_users:
                 _ct = Table(
                     title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
                     box=box.ROUNDED, border_style="bright_blue",
@@ -959,26 +969,53 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                 _ct.add_column("#",        style="bold bright_cyan", width=4)
                 _ct.add_column("Username", style="bold yellow",       width=26)
                 _ct.add_column("Password", style="dim",               width=36)
-                for _i, (_u, _p) in enumerate(_cred_pool, start=1):
-                    _ct.add_row(str(_i), _u, _p)
+                _ct.add_column("Source",   style="bright_blue",       width=10)
+
+                _all_rows: list[tuple[str, str, str]] = []  # (user, pass, source)
+                for (_u, _p, _src) in _cred_pool:
+                    _all_rows.append((_u, _p, _src))
+                    _ct.add_row(str(len(_all_rows)), _u, _p, _src)
+
+                # Hash-captured usernames — password not yet known (needs cracking)
+                for _hu in _hash_users:
+                    _all_rows.append((_hu, "", "hash"))
+                    _ct.add_row(
+                        str(len(_all_rows)), _hu,
+                        "[dim italic]enter cracked password[/dim italic]",
+                        "[yellow]hash[/yellow]",
+                    )
+
                 console.print(_ct)
                 console.print()
-                console.print("  [dim]Pick a number to use those credentials, or press Enter to type manually.[/dim]")
+                console.print("  [dim]Pick a number — hash entries will ask for the cracked password.[/dim]")
                 console.print()
 
                 _pick = Prompt.ask(
-                    "  [bold yellow]Select #[/bold yellow]",
+                    "  [bold yellow]Select #[/bold yellow] (Enter to type manually)",
                     default="",
                     show_default=False,
                 )
                 if _pick.strip().isdigit():
                     _idx = int(_pick.strip()) - 1
-                    if 0 <= _idx < len(_cred_pool):
-                        _selected_user, _selected_pass = _cred_pool[_idx]
-                        console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                    if 0 <= _idx < len(_all_rows):
+                        _sel_u, _sel_p, _sel_src = _all_rows[_idx]
+                        if _sel_p:
+                            # Full cred — ready to go
+                            _selected_user = _sel_u
+                            _selected_pass = _sel_p
+                            console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                        else:
+                            # Hash-user — pre-fill username, ask for cracked password
+                            _selected_user = _sel_u
+                            console.print(f"  [dim]Pre-selected username: {_selected_user}[/dim]")
+                            _selected_pass = Prompt.ask(
+                                f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan]",
+                                password=True,
+                            )
             else:
-                console.print("  [dim]No credentials discovered yet. Enter them manually.[/dim]")
+                console.print("  [dim]No credentials or captured hashes found in session.[/dim]")
                 console.print()
+
 
             # ── Manual entry fallback ───────────────────────────────────
             if not _selected_user:
