@@ -291,7 +291,7 @@ class LDAPEnumerationModule:
 
         # ── Step A: Anonymous bind test ────────────────────────────────
         anon_ok, anon_output, anon_err = self._try_anonymous_bind(
-            target, base_dn, port, use_ldaps
+            target, base_dn, port, use_ldaps, domain=domain
         )
 
         # ── Step B: Choose query auth mode ────────────────────────────
@@ -303,7 +303,7 @@ class LDAPEnumerationModule:
         guest_ok  = False
         guest_cred = None
         if not anon_ok and not has_creds:
-            guest_ok = self._try_guest_bind(target, base_dn, port, use_ldaps)
+            guest_ok = self._try_guest_bind(target, base_dn, port, use_ldaps, domain=domain)
             if guest_ok:
                 from session import Credentials as _Creds
                 guest_cred = _Creds(username="guest", password="")
@@ -384,9 +384,9 @@ class LDAPEnumerationModule:
                 }
 
 
-        user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=bind_creds)
-        group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds)
-        spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds)
+        user_raw  = self._query_users(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+        group_raw = self._query_groups(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
+        spn_raw   = self._query_spns(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
 
         # ── Step C: Parse results ──────────────────────────────────────
         user_entries  = _parse_ldif_entries(user_raw)
@@ -407,7 +407,7 @@ class LDAPEnumerationModule:
         groups = _parse_groups(group_entries)
 
         # ── Step D: Password policy ────────────────────────────────────
-        policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds)
+        policy = self._query_password_policy(target, base_dn, port, use_ldaps, creds=bind_creds, domain=domain)
         if policy:
             state.password_policy = policy
 
@@ -561,39 +561,41 @@ class LDAPEnumerationModule:
 
     def _build_base_args(
         self,
-        target:   str,
-        port:     int,
+        target:    str,
+        port:      int,
         use_ldaps: bool,
         creds,            # Credentials | None
+        domain:    str = "",
     ) -> list[str]:
         """
         Build the common ldapsearch arguments (host, port, bind DN, auth).
 
-        Anonymous mode:   -x -H ldap(s)://target:port
-        Authenticated:    -x -H ... -D "user@domain" -w "password"
+        Bind DN format:
+          - user@domain  (UPN — most compatible with Windows DCs)
+          - Falls back to bare username if no domain provided.
         """
         scheme = "ldaps" if use_ldaps else "ldap"
         args = [
             "ldapsearch",
-            "-x",                          # simple authentication (not SASL)
+            "-x",
             "-H", f"{scheme}://{target}:{port}",
-            "-o", "ldif-wrap=no",          # disable line-folding for clean parsing
+            "-o", "ldif-wrap=no",
         ]
 
         if use_ldaps:
-            # Disable certificate validation — assessment context, not production
             args += ["-o", "TLS_REQCERT=never"]
 
         if creds and creds.username:
-            # Both password and empty-string password ("") are valid:
-            # guest authentication uses user=guest with an empty password.
-            bind_dn = (
-                f"{creds.username}@{creds.username.split('@')[-1]}"
-                if "@" in creds.username
-                else creds.username
-            )
+            user = creds.username
+            # Build UPN: user@domain (preferred by Windows DCs)
+            if "@" in user:
+                bind_dn = user          # already user@domain
+            elif domain:
+                bind_dn = f"{user}@{domain}"
+            else:
+                bind_dn = user          # last resort bare username
+
             args += ["-D", bind_dn, "-w", creds.password]
-        # else: anonymous — no -D / -w flags
 
         return args
 
@@ -603,6 +605,7 @@ class LDAPEnumerationModule:
         base_dn:  str,
         port:     int,
         use_ldaps: bool,
+        domain:   str = "",
     ) -> tuple[bool, str, str]:
         """
         Attempt an anonymous LDAP bind by requesting only the root DSE.
@@ -612,7 +615,7 @@ class LDAPEnumerationModule:
         tuple[bool, str, str]
             (success, stdout, stderr)
         """
-        args = self._build_base_args(target, port, use_ldaps, creds=None)
+        args = self._build_base_args(target, port, use_ldaps, creds=None, domain=domain)
         args += [
             "-b", "",
             "-s", "base",
@@ -642,6 +645,7 @@ class LDAPEnumerationModule:
         base_dn:   str,
         port:      int,
         use_ldaps: bool,
+        domain:    str = "",
     ) -> bool:
         """
         Attempt an LDAP bind using 'guest' account with an empty password.
@@ -653,7 +657,7 @@ class LDAPEnumerationModule:
         from session import Credentials as _Creds
         guest = _Creds(username="guest", password="")
 
-        args = self._build_base_args(target, port, use_ldaps, creds=guest)
+        args = self._build_base_args(target, port, use_ldaps, creds=guest, domain=domain)
         args += [
             "-b", "",
             "-s", "base",
@@ -676,15 +680,11 @@ class LDAPEnumerationModule:
         return result["exit_code"] == 0 and not failed
 
     def _query_users(
-        self,
-        target:    str,
-        base_dn:   str,
-        port:      int,
-        use_ldaps: bool,
-        creds,
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
     ) -> str:
         """Query all user objects and return raw LDIF output."""
-        args = self._build_base_args(target, port, use_ldaps, creds)
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
         args += [
             "-b", base_dn,
             "-s", "sub",
@@ -695,15 +695,11 @@ class LDAPEnumerationModule:
         return result["output"]
 
     def _query_groups(
-        self,
-        target:    str,
-        base_dn:   str,
-        port:      int,
-        use_ldaps: bool,
-        creds,
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
     ) -> str:
         """Query all group objects and return raw LDIF output."""
-        args = self._build_base_args(target, port, use_ldaps, creds)
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
         args += [
             "-b", base_dn,
             "-s", "sub",
@@ -714,18 +710,11 @@ class LDAPEnumerationModule:
         return result["output"]
 
     def _query_spns(
-        self,
-        target:    str,
-        base_dn:   str,
-        port:      int,
-        use_ldaps: bool,
-        creds,
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
     ) -> str:
-        """
-        Query objects with a servicePrincipalName set (Kerberoastable accounts).
-        Uses a dedicated query with a filter on servicePrincipalName presence.
-        """
-        args = self._build_base_args(target, port, use_ldaps, creds)
+        """Query Kerberoastable service accounts."""
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
         args += [
             "-b", base_dn,
             "-s", "sub",
@@ -737,22 +726,11 @@ class LDAPEnumerationModule:
         return result["output"]
 
     def _query_password_policy(
-        self,
-        target:    str,
-        base_dn:   str,
-        port:      int,
-        use_ldaps: bool,
-        creds,
+        self, target: str, base_dn: str, port: int, use_ldaps: bool,
+        creds, domain: str = "",
     ) -> dict:
-        """
-        Query domain password policy attributes.
-
-        Exact playbook command:
-            ldapsearch -H ldap://<target> -x -b <base_dn> "(objectClass=domain)"
-                maxPwdAge minPwdLength pwdHistoryLength lockoutThreshold
-                lockoutDuration lockOutObservationWindow
-        """
-        args = self._build_base_args(target, port, use_ldaps, creds)
+        """Query domain password policy attributes."""
+        args = self._build_base_args(target, port, use_ldaps, creds, domain=domain)
         args += [
             "-b", base_dn,
             "-s", "base",
