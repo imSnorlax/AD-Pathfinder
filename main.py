@@ -914,34 +914,130 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             _display_asrep_results(result)
             save_session(state)
         elif choice == "2":
-            # Kerberoasting requires valid creds — prompt if not stored
+            # ── Kerberoasting credential resolution ────────────────────
+            # Build a list of all known creds from the session so the user
+            # can just pick a number instead of typing them out.
             from session import Credentials as _Creds
-            _has_creds = False
+
+            _cred_pool: list[tuple[str, str]] = []   # (username, password)
+
+            # 1. Description creds found during LDAP enum
+            for _df in getattr(state, "desc_findings", []):
+                _u = _df.get("username", "")
+                _p = _df.get("description", "")   # raw description contains the cred
+                if _u and _p:
+                    _cred_pool.append((_u, _p))
+
+            # 2. Valid creds confirmed by spraying / validation
+            for _vc in getattr(state, "valid_credentials", []):
+                _u = _vc.get("username", "")
+                _p = _vc.get("password", _vc.get("ntlm_hash", ""))
+                if _u and _p and (_u, _p) not in _cred_pool:
+                    _cred_pool.append((_u, _p))
+
+            # 3. Initial credentials (if they have a password set)
             _ic = state.initial_credentials
-            _vc = state.valid_credentials
-            if _vc:
-                _has_creds = True
-            elif _ic and _ic.username and (_ic.password or _ic.ntlm_hash):
-                _has_creds = True
+            if _ic and _ic.username and (_ic.password or _ic.ntlm_hash):
+                _p = _ic.password or _ic.ntlm_hash
+                if (_ic.username, _p) not in _cred_pool:
+                    _cred_pool.append((_ic.username, _p))
 
-            if not _has_creds:
-                console.print()
-                console.print("  [bold yellow]Kerberoasting requires domain credentials.[/bold yellow]")
-                console.print("  [dim]Enter a valid domain account (e.g. from description creds or spray results).[/dim]")
-                console.print()
-                _user = Prompt.ask("  [bold cyan]Username[/bold cyan]")
-                _pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", password=True)
-                if _user and _pass:
-                    state.initial_credentials = _Creds(username=_user, password=_pass)
-                    console.print(f"  [green]✔  Using credentials: {_user}[/green]")
-                else:
-                    console.print("  [red]No credentials entered — Kerberoasting aborted.[/red]")
-                    continue
+            # ── Display known creds if any ──────────────────────────────
+            console.print()
+            console.rule("[bold bright_cyan]Kerberoasting — Select Credentials[/bold bright_cyan]")
+            console.print()
 
+            _selected_user = ""
+            _selected_pass = ""
+
+            if _cred_pool:
+                _ct = Table(
+                    title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
+                    box=box.ROUNDED, border_style="bright_blue",
+                    show_lines=True, expand=False,
+                )
+                _ct.add_column("#",        style="bold bright_cyan", width=4)
+                _ct.add_column("Username", style="bold yellow",       width=26)
+                _ct.add_column("Password", style="dim",               width=36)
+                for _i, (_u, _p) in enumerate(_cred_pool, start=1):
+                    _ct.add_row(str(_i), _u, _p)
+                console.print(_ct)
+                console.print()
+                console.print("  [dim]Pick a number to use those credentials, or press Enter to type manually.[/dim]")
+                console.print()
+
+                _pick = Prompt.ask(
+                    "  [bold yellow]Select #[/bold yellow]",
+                    default="",
+                    show_default=False,
+                )
+                if _pick.strip().isdigit():
+                    _idx = int(_pick.strip()) - 1
+                    if 0 <= _idx < len(_cred_pool):
+                        _selected_user, _selected_pass = _cred_pool[_idx]
+                        console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+            else:
+                console.print("  [dim]No credentials discovered yet. Enter them manually.[/dim]")
+                console.print()
+
+            # ── Manual entry fallback ───────────────────────────────────
+            if not _selected_user:
+                _selected_user = Prompt.ask("  [bold cyan]Username[/bold cyan]")
+                _selected_pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", password=True)
+
+            if not _selected_user or not _selected_pass:
+                console.print("  [red]No credentials provided — Kerberoasting aborted.[/red]")
+                continue
+
+            state.initial_credentials = _Creds(
+                username=_selected_user,
+                password=_selected_pass,
+            )
+
+            # ── Run Kerberoasting ───────────────────────────────────────
             from modules.kerberoasting_module import run as kerb_run
             result = kerb_run(state)
+
+            # ── Handle password-must-change ─────────────────────────────
+            _combined_warn = " ".join(result.get("warnings", []) + [result.get("error", "") or ""])
+            if any(s in _combined_warn.lower() for s in (
+                "password must change", "password has expired",
+                "kdc_err_key_expired", "must change", "status_password_must_change"
+            )):
+                console.print()
+                console.print("  [bold red]⚠  Password must be changed before this account can be used.[/bold red]")
+                console.print(f"  [dim]Run the following to reset it:[/dim]")
+                console.print(f"  [bright_white]smbpasswd -r {state.target_ip} -U {_selected_user}[/bright_white]")
+                console.print()
+                if Prompt.ask(
+                    "  [bold yellow]Change password now?[/bold yellow]",
+                    choices=["yes", "no"], default="no"
+                ) == "yes":
+                    _new_pass = Prompt.ask("  [bold cyan]New password[/bold cyan]", password=True)
+                    _new_pass2 = Prompt.ask("  [bold cyan]Confirm new password[/bold cyan]", password=True)
+                    if _new_pass == _new_pass2 and _new_pass:
+                        from executor import CommandExecutor as _CE
+                        import os as _os2
+                        _env2 = dict(_os2.environ)
+                        for _v in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+                            _env2.pop(_v, None)
+                        _ce = _CE(verbose=False, default_timeout=30)
+                        _pr = _ce.run(
+                            ["smbpasswd", "-r", state.target_ip, "-U", _selected_user],
+                            env=_env2,
+                        )
+                        console.print(f"  [dim]smbpasswd output: {_pr['output'] or _pr['error']}[/dim]")
+                        # Retry kerberoasting with new password
+                        state.initial_credentials = _Creds(username=_selected_user, password=_new_pass)
+                        console.print()
+                        console.print("  [dim]Retrying Kerberoasting with new password...[/dim]")
+                        result = kerb_run(state)
+                    else:
+                        console.print("  [red]Passwords do not match — retry manually.[/red]")
+
             _display_kerb_results(result)
             save_session(state)
+
 
         elif choice == "3":
             passwords = Prompt.ask(
