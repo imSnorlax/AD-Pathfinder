@@ -338,7 +338,13 @@ class LDAPEnumerationModule:
         # Base DN is still built from the domain name (DC=VulnAD,DC=ma etc.).
         ldap_host = target
         use_ldaps = 636 in state.open_ports
-        port      = 636 if use_ldaps else 389
+        # Anonymous query ALWAYS uses plain ldap:// on port 389.
+        # This matches the working manual command:
+        #   ldapsearch -H ldap://<target> -x -b "<base_dn>" ...
+        # LDAPS (port 636) requires TLS negotiation that rejects anonymous
+        # binds on most DCs — use it only for authenticated fallback.
+        anon_port = 389
+        auth_port = 636 if use_ldaps else 389
 
         # ─────────────────────────────────────────────────────────────────────
         # Bind negotiation
@@ -375,8 +381,9 @@ class LDAPEnumerationModule:
 
         try:
             _info("Running anonymous user query (no -D / -w)...")
+            _info(f"Command: ldapsearch -H ldap://{ldap_host} -x -b \"{base_dn}\" \"(objectClass=User)\" sAMAccountName")
             anon_qresult = self._query_users_raw(
-                ldap_host, base_dn, port, use_ldaps, creds=None, domain=domain
+                ldap_host, base_dn, anon_port, False, creds=None, domain=domain
             )
             user_raw = anon_qresult["output"]
 
@@ -402,7 +409,7 @@ class LDAPEnumerationModule:
                         f"Anonymous bind denied; using session credentials '{creds.username}'."
                     )
                     auth_qresult = self._query_users_raw(
-                        ldap_host, base_dn, port, use_ldaps, creds=bind_creds, domain=domain
+                        ldap_host, base_dn, auth_port, use_ldaps, creds=bind_creds, domain=domain
                     )
                     user_raw = auth_qresult["output"]
                 else:
