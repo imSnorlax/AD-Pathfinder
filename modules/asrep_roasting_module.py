@@ -120,7 +120,9 @@ class ASREPRoastingModule:
     """
 
     def __init__(self, executor: Optional[CommandExecutor] = None) -> None:
-        self.executor = executor or CommandExecutor(verbose=False, default_timeout=180)
+        # 600s timeout: with 80+ users, each Kerberos request takes ~1-2s
+        # 180s (old default) was too close to the limit and caused silent truncation.
+        self.executor = executor or CommandExecutor(verbose=False, default_timeout=600)
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -232,8 +234,22 @@ class ASREPRoastingModule:
             f"-usersfile <{len(user_pool)} users>[/dim]"
         )
 
-        result   = self.executor.run(command)
+        result   = self.executor.run(
+            command,
+            # impacket exits 1 when some users fail (KDC_ERR_CLIENT_REVOKED etc.)
+            # even if hashes were captured for others — treat 0 and 1 as ok.
+            ok_exit_codes=(0, 1),
+        )
         combined = result["output"] + "\n" + result["error"]
+
+        # Log raw output so if hashes are still missing it's diagnosable
+        from rich.console import Console as _RCon2
+        if not combined.strip():
+            _RCon2().print("  [bold red]WARNING: impacket returned empty output — possible timeout or binary issue.[/bold red]")
+        else:
+            # Show first line of output as a sanity check
+            first_line = combined.strip().splitlines()[0] if combined.strip() else ""
+            _RCon2().print(f"  [dim]impacket output ({len(combined)} chars): {first_line[:100]}[/dim]")
 
         # ── Parse hashes from stdout ─────────────────────────────────────
         # impacket prints $krb5asrep$... lines directly to stdout when
