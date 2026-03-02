@@ -583,70 +583,59 @@ class SMBEnumerationModule:
         _info=None,
     ) -> tuple[list[str], list[str]]:
         """
-        Step 3 — RID brute-force via PTY.
+        Step 3 — RID brute-force.
 
+        Uses `script -q -c "netexec ..." /dev/null` to run nxc inside a
+        pseudo-terminal.  This makes nxc believe it is connected to a terminal
+        (isatty() == True) and produce its normal Rich-formatted output, while
+        we capture everything cleanly from script's stdout via PIPE.
+
+        Falls back to plain subprocess if `script` is unavailable.
         Tries target_ip first, then domain as fallback.
-        Command: netexec smb <target> -u guest -p '' --rid-brute
-        Uses provided creds if set, otherwise guest.
         """
-        import pty
-        import select
-        import re as _re
         import subprocess as _sp
-        import time
+        import shlex
+        import re as _re
+        import shutil
+
+        _ansi = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
+
+        def _run(cmd: list[str], timeout: int = 120) -> str:
+            """Run cmd, capturing output. Uses `script` wrapper if available."""
+            if shutil.which("script"):
+                # script -q -c "CMD" /dev/null
+                # -q  : suppress 'Script started/ended' messages
+                # /dev/null: discard typescript file
+                # nxc runs inside the PTY that script creates → isatty()=True
+                inner = " ".join(shlex.quote(a) for a in cmd)
+                wrapped = ["script", "-q", "-c", inner, "/dev/null"]
+                try:
+                    result = _sp.run(
+                        wrapped,
+                        stdout=_sp.PIPE,
+                        stderr=_sp.PIPE,
+                        timeout=timeout,
+                    )
+                    out = (result.stdout or b"").decode("utf-8", errors="replace")
+                    err = (result.stderr or b"").decode("utf-8", errors="replace")
+                    return _ansi.sub("", out + err)
+                except Exception:
+                    pass  # fall through to plain subprocess
+
+            # Plain subprocess fallback
+            result = _sp.run(
+                cmd,
+                stdout=_sp.PIPE,
+                stderr=_sp.PIPE,
+                timeout=timeout,
+            )
+            out = (result.stdout or b"").decode("utf-8", errors="replace")
+            err = (result.stderr or b"").decode("utf-8", errors="replace")
+            return _ansi.sub("", out + err)
 
         def _warn(msg: str) -> None:
             if _info:
                 _info(msg)
-
-        _ansi = _re.compile(r"\x1b\[[0-9;]*[mGKHF]|\x1b\[?[0-9;]*[a-zA-Z]|\r")
-
-        def _run_pty(cmd: list[str], timeout: int = 120) -> str:
-            master_fd, slave_fd = pty.openpty()
-            chunks: list[bytes] = []
-            try:
-                proc = _sp.Popen(
-                    cmd, stdout=slave_fd, stderr=slave_fd,
-                    stdin=slave_fd, close_fds=True,
-                )
-                os.close(slave_fd)
-                deadline = time.time() + timeout
-                while True:
-                    remaining = max(0.0, deadline - time.time())
-                    if remaining == 0:
-                        proc.kill()
-                        break
-                    ready, _, _ = select.select([master_fd], [], [], min(remaining, 1.0))
-                    if ready:
-                        try:
-                            data = os.read(master_fd, 4096)
-                            if data:
-                                chunks.append(data)
-                            else:
-                                break
-                        except OSError:
-                            break
-                    if proc.poll() is not None:
-                        try:
-                            while True:
-                                r, _, _ = select.select([master_fd], [], [], 0.2)
-                                if not r:
-                                    break
-                                d = os.read(master_fd, 4096)
-                                if d:
-                                    chunks.append(d)
-                                else:
-                                    break
-                        except OSError:
-                            pass
-                        break
-                proc.wait(timeout=5)
-            finally:
-                try:
-                    os.close(master_fd)
-                except OSError:
-                    pass
-            return _ansi.sub("", b"".join(chunks).decode("utf-8", errors="replace"))
 
         cme = self._find_cme()
         if not cme:
@@ -656,15 +645,15 @@ class SMBEnumerationModule:
 
         # Build auth args
         if creds and creds.username and (creds.password or creds.ntlm_hash):
-            label  = f"creds:{creds.username}"
-            auth   = ["-u", creds.username,
-                      "-H", creds.ntlm_hash] if creds.ntlm_hash else [
-                      "-u", creds.username, "-p", creds.password]
+            label = f"creds:{creds.username}"
+            auth = ["-u", creds.username,
+                    "-H", creds.ntlm_hash] if creds.ntlm_hash else [
+                    "-u", creds.username, "-p", creds.password]
         else:
             label = "guest"
-            auth  = ["-u", "guest", "-p", ""]
+            auth = ["-u", "guest", "-p", ""]
 
-        # Try IP first, then domain — covers both DNS and direct-IP setups
+        # Try IP first, then domain
         targets_to_try: list[tuple[str, str]] = [(target_ip, "IP")]
         if domain and domain != target_ip:
             targets_to_try.append((domain, "domain"))
@@ -672,23 +661,19 @@ class SMBEnumerationModule:
         for t, t_label in targets_to_try:
             cmd = [cme, "smb", t] + auth + ["--rid-brute"]
             raw_log.append(f"## Step 3 ({label} via {t_label}): {' '.join(cmd)}")
-            _info(f"Running: {' '.join(cmd)}")
+            _info(f"  → {' '.join(cmd)}")
 
-            output = ""
             try:
-                output = _run_pty(cmd, timeout=120)
+                output = _run(cmd, timeout=120)
             except Exception as exc:
-                raw_log.append(f"## Step 3 PTY error: {exc} — falling back to PIPE")
-                try:
-                    res = self._quiet_exec.run(cmd, ok_exit_codes=(0, 1))
-                    output = res["output"] + res["error"]
-                except Exception as exc2:
-                    raw_log.append(f"## Step 3 PIPE fallback error: {exc2}")
+                raw_log.append(f"## Step 3 error ({t_label}): {exc}")
+                _warn(f"RID brute error: {exc}")
+                continue
 
             raw_log.append(f"## Step 3 ({t_label}) output (first 2000):\n{output[:2000]}")
 
             if not output.strip():
-                _warn(f"RID brute ({t_label}) returned no output")
+                _warn(f"RID brute via {t_label} returned no output")
                 continue
 
             users, groups = parse_rid_output(output)
@@ -696,7 +681,7 @@ class SMBEnumerationModule:
                 return users, groups
 
             _warn(
-                f"RID brute ({t_label}) returned output but no SidType objects — "
+                f"RID brute via {t_label} returned output but no SidType objects — "
                 "likely restricted or requires authentication"
             )
 
