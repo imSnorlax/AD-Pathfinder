@@ -1033,22 +1033,47 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                             _selected_pass = _sel_p
                             console.print(f"  [green]✔  Using: {_selected_user}[/green]")
                         else:
-                            # Hash-user — pre-fill username, ask for cracked password
+                            # Hash-user — password not yet cracked.
+                            # Prompt visibly (not hidden) so the user can verify what they type.
                             _selected_user = _sel_u
-                            console.print(f"  [dim]Pre-selected username: {_selected_user}[/dim]")
-                            _selected_pass = Prompt.ask(
-                                f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan]",
-                                password=True,
+                            console.print()
+                            console.print(
+                                f"  [bold yellow]⚠  '{_selected_user}' was captured as a hash.[/bold yellow]"
                             )
+                            console.print(
+                                "  [dim]You need to crack the hash first with hashcat, then enter the result here.[/dim]"
+                            )
+                            console.print(
+                                "  [dim]Press Enter with no password to skip and enter credentials manually.[/dim]"
+                            )
+                            console.print()
+                            _cracked = Prompt.ask(
+                                f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan] "
+                                "[dim](leave blank to skip)[/dim]",
+                                default="",
+                                show_default=False,
+                                password=False,   # visible so user can verify typing
+                            ).strip()
+                            if _cracked:
+                                _selected_pass = _cracked
+                                console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                            else:
+                                # User doesn't have the cracked password yet — clear the
+                                # pre-filled username so the manual fallback fires below.
+                                console.print(
+                                    "  [yellow]⚠  No password entered — falling back to manual input.[/yellow]"
+                                )
+                                _selected_user = ""
             else:
                 console.print("  [dim]No credentials or captured hashes found in session.[/dim]")
                 console.print()
 
 
             # ── Manual entry fallback ───────────────────────────────────
-            if not _selected_user:
-                _selected_user = Prompt.ask("  [bold cyan]Username[/bold cyan]")
-                _selected_pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", password=True)
+            if not _selected_user or not _selected_pass:
+                console.print()
+                _selected_user = Prompt.ask("  [bold cyan]Username[/bold cyan]", default="").strip()
+                _selected_pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", default="").strip() if _selected_user else ""
 
             if not _selected_user or not _selected_pass:
                 console.print("  [red]No credentials provided — Kerberoasting aborted.[/red]")
