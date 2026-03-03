@@ -1037,17 +1037,16 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                 if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
                     _cred_pool.append((u, p, src))
 
-            # a) Description-field credentials found during LDAP enum
-            for _df in getattr(state, "desc_findings", []):
-                _add_if_new(_df.get("username", ""), _df.get("description", ""), "desc")
+            # a) Valid credentials confirmed by spraying / cred-validation
+            #    (desc_findings contain raw text, not clean passwords — excluded here)
 
-            # b) Valid credentials confirmed by spraying / cred-validation
             for _vc in getattr(state, "valid_credentials", []):
                 _add_if_new(
                     _vc.get("username", ""),
                     _vc.get("password", _vc.get("ntlm_hash", "")),
                     "spray",
                 )
+
 
             # c) Cracked passwords stored from previous hash-cracking runs
             for _cp in getattr(state, "cracked_passwords", []):
@@ -1107,15 +1106,37 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                         _selected_user, _selected_pass, _ = _cred_pool[_i]
                         console.print(f"  [green]✔  Using: {_selected_user}[/green]")
             else:
-                console.print(
-                    "  [dim]No credentials found in session — "
-                    "enter below.[/dim]"
-                )
-                console.print()
+                # No plaintext creds yet — show discovered users as a
+                # read-only reference so the operator knows what's available.
+                _known_users: list[str] = sorted(set(
+                    getattr(state, "users", [])
+                    + [u for u in getattr(state, "asrep_users", [])]
+                ))
+                if _known_users:
+                    console.print(
+                        "  [dim]No plaintext credentials in session. "
+                        "Discovered domain accounts:[/dim]"
+                    )
+                    console.print()
+                    # Print in columns of 4
+                    _cols = 4
+                    for _row_start in range(0, len(_known_users), _cols):
+                        _chunk = _known_users[_row_start:_row_start + _cols]
+                        console.print(
+                            "  " + "    ".join(
+                                f"[yellow]{_un}[/yellow]" for _un in _chunk
+                            )
+                        )
+                    console.print()
+                else:
+                    console.print(
+                        "  [dim]No credentials or users found in session.[/dim]"
+                    )
+                    console.print()
 
-            # ── 4. Manual fallback (always available) ─────────────────────
+            # ── 4. Manual entry (always available, required when no pick made) ─
             if not _selected_user or not _selected_pass:
-                console.print()
+                console.print("  [bold bright_cyan]Enter credentials to authenticate:[/bold bright_cyan]")
                 _selected_user = Prompt.ask(
                     "  [bold cyan]Username[/bold cyan]", default=""
                 ).strip()
