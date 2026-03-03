@@ -5,6 +5,7 @@ A modular Active Directory assessment CLI tool.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.console import Console
