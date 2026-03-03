@@ -1023,96 +1023,57 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             _display_asrep_results(result)
             save_session(state)
         elif choice == "2":
-            # ── Kerberoasting credential resolution ────────────────────
-            # Build a list of all known creds from the session so the user
-            # can just pick a number instead of typing them out.
+            # ── Kerberoasting — credential selection ──────────────────────
+            # Build a numbered table of every known credential in the session.
+            # The user picks a number OR presses Enter to type manually.
+            # We NEVER refuse to run just because no cracked hashes exist.
             from session import Credentials as _Creds
 
-            _cred_pool: list[tuple[str, str, str]] = []   # (username, password, source)
+            # ── 1. Collect all available credentials ──────────────────────
+            # (username, password_or_hash, label)
+            _cred_pool: list[tuple[str, str, str]] = []
 
-            # 1. Description creds found during LDAP enum
+            def _add_if_new(u: str, p: str, src: str) -> None:
+                if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
+                    _cred_pool.append((u, p, src))
+
+            # a) Description-field credentials found during LDAP enum
             for _df in getattr(state, "desc_findings", []):
-                _u = _df.get("username", "")
-                _p = _df.get("description", "")   # raw description contains the cred
-                if _u and _p:
-                    _cred_pool.append((_u, _p, "desc"))
+                _add_if_new(_df.get("username", ""), _df.get("description", ""), "desc")
 
-            # 2. Valid creds confirmed by spraying / validation
+            # b) Valid credentials confirmed by spraying / cred-validation
             for _vc in getattr(state, "valid_credentials", []):
-                _u = _vc.get("username", "")
-                _p = _vc.get("password", _vc.get("ntlm_hash", ""))
-                if _u and _p and not any(c[0] == _u and c[1] == _p for c in _cred_pool):
-                    _cred_pool.append((_u, _p, "spray"))
+                _add_if_new(
+                    _vc.get("username", ""),
+                    _vc.get("password", _vc.get("ntlm_hash", "")),
+                    "spray",
+                )
 
-            # 3. Initial credentials (if non-guest with a password set)
+            # c) Cracked passwords stored from previous hash-cracking runs
+            for _cp in getattr(state, "cracked_passwords", []):
+                _add_if_new(_cp.get("username", ""), _cp.get("password", ""), "cracked")
+
+            # d) Session initial credentials (supplied at assessment start)
             _ic = state.initial_credentials
-            if _ic and _ic.username and (_ic.password or _ic.ntlm_hash):
-                _p = _ic.password or _ic.ntlm_hash
-                if not any(c[0] == _ic.username and c[1] == _p for c in _cred_pool):
-                    _cred_pool.append((_ic.username, _p, "session"))
+            if _ic and _ic.username:
+                _add_if_new(_ic.username, _ic.password or _ic.ntlm_hash, "session")
 
-            # 4. Usernames from state.hashes (AS-REP / TGS captures)
-            #    PLUS fallback: read the asrep hash file from disk when the
-            #    session was saved before the run completed (state.hashes empty).
-            _hash_users: list[str] = []
-
-            def _users_from_state_hashes() -> list[str]:
-                out = []
-                for _h in getattr(state, "hashes", []):
-                    _hu = _h.get("username", "")
-                    # Strip @DOMAIN suffix if present
-                    _hu = _hu.split("@")[0] if "@" in _hu else _hu
-                    if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in out:
-                        out.append(_hu)
-                return out
-
-            def _users_from_asrep_file() -> list[str]:
-                """Parse $krb5asrep$23$user@DOMAIN:hash lines from the saved file."""
-                import re as _re
-                _path = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
-                if not os.path.isfile(_path):
-                    return []
-                out = []
-                _pat = _re.compile(r"\$krb5asrep\$\d+\$([^@]+)@", _re.IGNORECASE)
-                try:
-                    with open(_path, encoding="utf-8", errors="replace") as _fh:
-                        for _line in _fh:
-                            _m = _pat.search(_line)
-                            if _m:
-                                _hu = _m.group(1).strip()
-                                if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in out:
-                                    out.append(_hu)
-                except OSError:
-                    pass
-                return out
-
-            _hash_users = _users_from_state_hashes() or _users_from_asrep_file()
-
-            # ── Auto-resolve cracked passwords from hashcat potfile ─────
-            if _hash_users:
-                console.print("  [dim]Checking hashcat potfile for cracked passwords…[/dim]")
+            # ── 2. Auto-check hashcat potfile for any uncracked hashes ────
             _cracked_map = _resolve_cracked_passwords(state)
+            for _u, _pw in _cracked_map.items():
+                _add_if_new(_u, _pw, "cracked")
             if _cracked_map:
-                # Move cracked hash-users into the cred pool (with plaintext)
-                _still_uncracked: list[str] = []
-                for _hu in _hash_users:
-                    if _hu in _cracked_map and not any(c[0] == _hu for c in _cred_pool):
-                        _cred_pool.append((_hu, _cracked_map[_hu], "cracked"))
-                    else:
-                        _still_uncracked.append(_hu)
-                _hash_users = _still_uncracked
-                if _cracked_map:
-                    save_session(state)   # persist newly cracked passwords
+                save_session(state)
 
-            # ── Display known creds if any ──────────────────────────────
+            # ── 3. Display credentials table (if any) ─────────────────────
             console.print()
-            console.rule("[bold bright_cyan]Kerberoasting — Select Credentials[/bold bright_cyan]")
+            console.rule("[bold bright_cyan]Kerberoasting — Credentials[/bold bright_cyan]")
             console.print()
 
             _selected_user = ""
             _selected_pass = ""
 
-            if _cred_pool or _hash_users:
+            if _cred_pool:
                 _ct = Table(
                     title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
                     box=box.ROUNDED, border_style="bright_blue",
@@ -1121,242 +1082,110 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                 _ct.add_column("#",        style="bold bright_cyan", width=4)
                 _ct.add_column("Username", style="bold yellow",       width=26)
                 _ct.add_column("Password", style="dim",               width=36)
-                _ct.add_column("Source",   style="bright_blue",       width=10)
+                _ct.add_column("Source",   style="bright_blue",       width=12)
 
-                _all_rows: list[tuple[str, str, str]] = []  # (user, pass, source)
-                for (_u, _p, _src) in _cred_pool:
-                    _all_rows.append((_u, _p, _src))
-                    _pw_display = (
-                        f"[bold green]{_p}[/bold green]" if _src == "cracked" else _p
-                    )
-                    _src_display = (
+                for _idx, (_u, _p, _src) in enumerate(_cred_pool, start=1):
+                    _pw_disp  = f"[bold green]{_p}[/bold green]" if _src == "cracked" else _p
+                    _src_disp = (
                         "[bold green]cracked ✔[/bold green]" if _src == "cracked"
                         else f"[bright_blue]{_src}[/bright_blue]"
                     )
-                    _ct.add_row(str(len(_all_rows)), _u, _pw_display, _src_display)
-
-                # Hash-captured usernames — not yet cracked
-                for _hu in _hash_users:
-                    _all_rows.append((_hu, "", "hash"))
-                    _ct.add_row(
-                        str(len(_all_rows)), _hu,
-                        "[dim italic]not cracked yet[/dim italic]",
-                        "[yellow]hash[/yellow]",
-                    )
+                    _ct.add_row(str(_idx), _u, _pw_disp, _src_disp)
 
                 console.print(_ct)
-                if _hash_users:
-                    console.print()
-                    console.print(
-                        "  [dim]Hash entries marked [yellow]not cracked yet[/yellow] — "
-                        "crack with:[/dim]"
-                    )
-                    _asrep_f = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
-                    if os.path.isfile(_asrep_f):
-                        console.print(
-                            f"  [dim]hashcat -m 18200 {_asrep_f} "
-                            "/usr/share/wordlists/rockyou.txt --force[/dim]"
-                        )
-                    console.print(
-                        "  [dim]Then re-run Kerberoasting — cracked passwords are detected automatically.[/dim]"
-                    )
                 console.print()
 
                 _pick = Prompt.ask(
                     "  [bold yellow]Select #[/bold yellow] (Enter to type manually)",
                     default="",
                     show_default=False,
-                )
-                if _pick.strip().isdigit():
-                    _idx = int(_pick.strip()) - 1
-                    if 0 <= _idx < len(_all_rows):
-                        _sel_u, _sel_p, _sel_src = _all_rows[_idx]
-                        if _sel_p:
-                            # Full cred — ready to go
-                            _selected_user = _sel_u
-                            _selected_pass = _sel_p
-                            console.print(f"  [green]✔  Using: {_selected_user}[/green]")
-                        else:
-                            # Hash-user — password not yet cracked.
-                            _selected_user = _sel_u
-                            _asrep_f = os.path.join(
-                                "reports", f"{state.assessment_id}-asrep.txt"
-                            )
-                            _kerb_f = os.path.join(
-                                "reports", f"{state.assessment_id}-kerb.txt"
-                            )
-                            # Pick whichever hash file exists
-                            _hash_f = _asrep_f if os.path.isfile(_asrep_f) else (
-                                _kerb_f if os.path.isfile(_kerb_f) else ""
-                            )
-                            _wl = "/usr/share/wordlists/rockyou.txt"
+                ).strip()
 
-                            console.print()
-                            console.print(
-                                f"  [bold yellow]⚠  '{_selected_user}' is not cracked yet.[/bold yellow]"
-                            )
-                            console.print()
-                            console.print("  [bold bright_cyan]Options:[/bold bright_cyan]")
-                            console.print(
-                                "  [bright_cyan]1.[/bright_cyan]  Run hashcat now "
-                                f"[dim](hashcat -m 18200 {_hash_f or '<hash file>'} {_wl} --force)[/dim]"
-                            )
-                            console.print(
-                                "  [bright_cyan]2.[/bright_cyan]  Enter cracked password manually"
-                            )
-                            console.print(
-                                "  [bright_cyan]0.[/bright_cyan]  Back / abort"
-                            )
-                            console.print()
-                            _hchoice = Prompt.ask(
-                                "  [bold yellow]Select[/bold yellow]",
-                                choices=["0", "1", "2"],
-                                show_choices=False,
-                                default="0",
-                            )
-
-                            if _hchoice == "1":
-                                # ── Run hashcat inline ──────────────────
-                                if not _hash_f:
-                                    console.print(
-                                        "  [red]No hash file found in reports/. "
-                                        "Run AS-REP Roasting first.[/red]"
-                                    )
-                                    _selected_user = ""
-                                elif not os.path.isfile(_wl):
-                                    console.print(
-                                        f"  [red]Wordlist not found: {_wl}[/red]"
-                                    )
-                                    _selected_user = ""
-                                else:
-                                    console.print()
-                                    console.print(
-                                        "  [bold cyan]Running hashcat — this may take a few minutes…[/bold cyan]"
-                                    )
-                                    console.print(
-                                        f"  [dim]hashcat -m 18200 {_hash_f} {_wl} --force[/dim]"
-                                    )
-                                    import subprocess as _sp2
-                                    try:
-                                        _sp2.run(
-                                            ["hashcat", "-m", "18200", _hash_f, _wl, "--force"],
-                                            timeout=600,
-                                        )
-                                    except FileNotFoundError:
-                                        console.print("  [red]hashcat not found — install it first.[/red]")
-                                        _selected_user = ""
-                                    except _sp2.TimeoutExpired:
-                                        console.print("  [yellow]⚠  hashcat timed out after 10 min.[/yellow]")
-
-                                    if _selected_user:
-                                        # Re-run potfile check to pick up newly cracked pw
-                                        console.print()
-                                        console.print("  [dim]Re-checking potfile…[/dim]")
-                                        _new_map = _resolve_cracked_passwords(state)
-                                        if _selected_user in _new_map:
-                                            _selected_pass = _new_map[_selected_user]
-                                            save_session(state)
-                                            console.print(
-                                                f"  [bold green]✔  Cracked! Password for "
-                                                f"{_selected_user} recovered.[/bold green]"
-                                            )
-                                        else:
-                                            console.print(
-                                                "  [yellow]⚠  Hash not cracked — "
-                                                "try a different wordlist or rule.[/yellow]"
-                                            )
-                                            _selected_user = ""
-
-                            elif _hchoice == "2":
-                                # ── Manual paste ────────────────────────
-                                _cracked = Prompt.ask(
-                                    f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan]",
-                                    default="",
-                                    show_default=False,
-                                    password=False,
-                                ).strip()
-                                if _cracked:
-                                    _selected_pass = _cracked
-                                    # Persist it
-                                    _existing_c = {
-                                        cp["username"]
-                                        for cp in getattr(state, "cracked_passwords", [])
-                                    }
-                                    if _selected_user not in _existing_c:
-                                        state.cracked_passwords.append({
-                                            "username": _selected_user,
-                                            "password": _cracked,
-                                            "source": "manual",
-                                        })
-                                        save_session(state)
-                                    console.print(f"  [green]✔  Using: {_selected_user}[/green]")
-                                else:
-                                    console.print("  [yellow]No password entered — aborting.[/yellow]")
-                                    _selected_user = ""
-
-                            else:
-                                # 0 — abort / back
-                                _selected_user = ""
+                if _pick.isdigit():
+                    _i = int(_pick) - 1
+                    if 0 <= _i < len(_cred_pool):
+                        _selected_user, _selected_pass, _ = _cred_pool[_i]
+                        console.print(f"  [green]✔  Using: {_selected_user}[/green]")
             else:
-                console.print("  [dim]No credentials or captured hashes found in session.[/dim]")
+                console.print(
+                    "  [dim]No credentials found in session — "
+                    "enter below.[/dim]"
+                )
                 console.print()
 
-
-            # ── Manual entry fallback ───────────────────────────────────
+            # ── 4. Manual fallback (always available) ─────────────────────
             if not _selected_user or not _selected_pass:
                 console.print()
-                _selected_user = Prompt.ask("  [bold cyan]Username[/bold cyan]", default="").strip()
-                _selected_pass = Prompt.ask("  [bold cyan]Password[/bold cyan]", default="").strip() if _selected_user else ""
+                _selected_user = Prompt.ask(
+                    "  [bold cyan]Username[/bold cyan]", default=""
+                ).strip()
+                if _selected_user:
+                    _selected_pass = Prompt.ask(
+                        "  [bold cyan]Password[/bold cyan]", default=""
+                    ).strip()
 
             if not _selected_user or not _selected_pass:
-                console.print("  [red]No credentials provided — Kerberoasting aborted.[/red]")
+                console.print(
+                    "  [red]No credentials provided — Kerberoasting aborted.[/red]"
+                )
                 continue
 
+            # ── 5. Inject into state so the module picks them up ──────────
             state.initial_credentials = _Creds(
                 username=_selected_user,
                 password=_selected_pass,
             )
 
-            # ── Run Kerberoasting ───────────────────────────────────────
+            # ── 6. Run Kerberoasting ──────────────────────────────────────
             from modules.kerberoasting_module import run as kerb_run
             result = kerb_run(state)
 
-            # ── Handle password-must-change ─────────────────────────────
-            _combined_warn = " ".join(result.get("warnings", []) + [result.get("error", "") or ""])
-            if any(s in _combined_warn.lower() for s in (
+            # ── 7. Handle "password must change" KDC error ────────────────
+            _warn_blob = " ".join(
+                result.get("warnings", []) + [result.get("error", "") or ""]
+            ).lower()
+            if any(s in _warn_blob for s in (
                 "password must change", "password has expired",
-                "kdc_err_key_expired", "must change", "status_password_must_change"
+                "kdc_err_key_expired", "must change", "status_password_must_change",
             )):
                 console.print()
-                console.print("  [bold red]⚠  Password must be changed before this account can be used.[/bold red]")
-                console.print(f"  [dim]Run the following to reset it:[/dim]")
-                console.print(f"  [bright_white]smbpasswd -r {state.target_ip} -U {_selected_user}[/bright_white]")
+                console.print(
+                    "  [bold red]⚠  Password must be changed before this "
+                    "account can be used.[/bold red]"
+                )
+                console.print(
+                    f"  [bright_white]smbpasswd -r {state.target_ip} "
+                    f"-U {_selected_user}[/bright_white]"
+                )
                 console.print()
                 if Prompt.ask(
                     "  [bold yellow]Change password now?[/bold yellow]",
-                    choices=["yes", "no"], default="no"
+                    choices=["yes", "no"], default="no",
                 ) == "yes":
-                    _new_pass = Prompt.ask("  [bold cyan]New password[/bold cyan]", password=True)
+                    _new_pass  = Prompt.ask("  [bold cyan]New password[/bold cyan]",    password=True)
                     _new_pass2 = Prompt.ask("  [bold cyan]Confirm new password[/bold cyan]", password=True)
-                    if _new_pass == _new_pass2 and _new_pass:
+                    if _new_pass and _new_pass == _new_pass2:
                         from executor import CommandExecutor as _CE
-                        import os as _os2
-                        _env2 = dict(_os2.environ)
+                        _env2 = dict(os.environ)
                         for _v in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
                             _env2.pop(_v, None)
-                        _ce = _CE(verbose=False, default_timeout=30)
-                        _pr = _ce.run(
+                        _ce  = _CE(verbose=False, default_timeout=30)
+                        _pr  = _ce.run(
                             ["smbpasswd", "-r", state.target_ip, "-U", _selected_user],
                             env=_env2,
                         )
-                        console.print(f"  [dim]smbpasswd output: {_pr['output'] or _pr['error']}[/dim]")
-                        # Retry kerberoasting with new password
-                        state.initial_credentials = _Creds(username=_selected_user, password=_new_pass)
-                        console.print()
-                        console.print("  [dim]Retrying Kerberoasting with new password...[/dim]")
+                        console.print(
+                            f"  [dim]smbpasswd: {_pr['output'] or _pr['error']}[/dim]"
+                        )
+                        state.initial_credentials = _Creds(
+                            username=_selected_user, password=_new_pass
+                        )
+                        console.print("  [dim]Retrying Kerberoasting…[/dim]")
                         result = kerb_run(state)
                     else:
-                        console.print("  [red]Passwords do not match — retry manually.[/red]")
+                        console.print(
+                            "  [red]Passwords do not match — retry manually.[/red]"
+                        )
 
             _display_kerb_results(result)
             save_session(state)
