@@ -942,14 +942,42 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                 if not any(c[0] == _ic.username and c[1] == _p for c in _cred_pool):
                     _cred_pool.append((_ic.username, _p, "session"))
 
-            # 4. Usernames from captured hashes (AS-REP / TGS) — password needed
-            # Cracking is done offline; we just pre-fill the username so the user
-            # only has to type their cracked password, not the full username.
+            # 4. Usernames from state.hashes (AS-REP / TGS captures)
+            #    PLUS fallback: read the asrep hash file from disk when the
+            #    session was saved before the run completed (state.hashes empty).
             _hash_users: list[str] = []
-            for _h in getattr(state, "hashes", []):
-                _hu = _h.get("username", "")
-                if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in _hash_users:
-                    _hash_users.append(_hu)
+
+            def _users_from_state_hashes() -> list[str]:
+                out = []
+                for _h in getattr(state, "hashes", []):
+                    _hu = _h.get("username", "")
+                    # Strip @DOMAIN suffix if present
+                    _hu = _hu.split("@")[0] if "@" in _hu else _hu
+                    if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in out:
+                        out.append(_hu)
+                return out
+
+            def _users_from_asrep_file() -> list[str]:
+                """Parse $krb5asrep$23$user@DOMAIN:hash lines from the saved file."""
+                import re as _re
+                _path = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
+                if not os.path.isfile(_path):
+                    return []
+                out = []
+                _pat = _re.compile(r"\$krb5asrep\$\d+\$([^@]+)@", _re.IGNORECASE)
+                try:
+                    with open(_path, encoding="utf-8", errors="replace") as _fh:
+                        for _line in _fh:
+                            _m = _pat.search(_line)
+                            if _m:
+                                _hu = _m.group(1).strip()
+                                if _hu and not any(c[0] == _hu for c in _cred_pool) and _hu not in out:
+                                    out.append(_hu)
+                except OSError:
+                    pass
+                return out
+
+            _hash_users = _users_from_state_hashes() or _users_from_asrep_file()
 
 
             # ── Display known creds if any ──────────────────────────────
