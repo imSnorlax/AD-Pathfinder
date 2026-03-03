@@ -1205,35 +1205,124 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                             console.print(f"  [green]✔  Using: {_selected_user}[/green]")
                         else:
                             # Hash-user — password not yet cracked.
-                            # Prompt visibly (not hidden) so the user can verify what they type.
                             _selected_user = _sel_u
+                            _asrep_f = os.path.join(
+                                "reports", f"{state.assessment_id}-asrep.txt"
+                            )
+                            _kerb_f = os.path.join(
+                                "reports", f"{state.assessment_id}-kerb.txt"
+                            )
+                            # Pick whichever hash file exists
+                            _hash_f = _asrep_f if os.path.isfile(_asrep_f) else (
+                                _kerb_f if os.path.isfile(_kerb_f) else ""
+                            )
+                            _wl = "/usr/share/wordlists/rockyou.txt"
+
                             console.print()
                             console.print(
-                                f"  [bold yellow]⚠  '{_selected_user}' was captured as a hash.[/bold yellow]"
-                            )
-                            console.print(
-                                "  [dim]You need to crack the hash first with hashcat, then enter the result here.[/dim]"
-                            )
-                            console.print(
-                                "  [dim]Press Enter with no password to skip and enter credentials manually.[/dim]"
+                                f"  [bold yellow]⚠  '{_selected_user}' is not cracked yet.[/bold yellow]"
                             )
                             console.print()
-                            _cracked = Prompt.ask(
-                                f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan] "
-                                "[dim](leave blank to skip)[/dim]",
-                                default="",
-                                show_default=False,
-                                password=False,   # visible so user can verify typing
-                            ).strip()
-                            if _cracked:
-                                _selected_pass = _cracked
-                                console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                            console.print("  [bold bright_cyan]Options:[/bold bright_cyan]")
+                            console.print(
+                                "  [bright_cyan]1.[/bright_cyan]  Run hashcat now "
+                                f"[dim](hashcat -m 18200 {_hash_f or '<hash file>'} {_wl} --force)[/dim]"
+                            )
+                            console.print(
+                                "  [bright_cyan]2.[/bright_cyan]  Enter cracked password manually"
+                            )
+                            console.print(
+                                "  [bright_cyan]0.[/bright_cyan]  Back / abort"
+                            )
+                            console.print()
+                            _hchoice = Prompt.ask(
+                                "  [bold yellow]Select[/bold yellow]",
+                                choices=["0", "1", "2"],
+                                show_choices=False,
+                                default="0",
+                            )
+
+                            if _hchoice == "1":
+                                # ── Run hashcat inline ──────────────────
+                                if not _hash_f:
+                                    console.print(
+                                        "  [red]No hash file found in reports/. "
+                                        "Run AS-REP Roasting first.[/red]"
+                                    )
+                                    _selected_user = ""
+                                elif not os.path.isfile(_wl):
+                                    console.print(
+                                        f"  [red]Wordlist not found: {_wl}[/red]"
+                                    )
+                                    _selected_user = ""
+                                else:
+                                    console.print()
+                                    console.print(
+                                        "  [bold cyan]Running hashcat — this may take a few minutes…[/bold cyan]"
+                                    )
+                                    console.print(
+                                        f"  [dim]hashcat -m 18200 {_hash_f} {_wl} --force[/dim]"
+                                    )
+                                    import subprocess as _sp2
+                                    try:
+                                        _sp2.run(
+                                            ["hashcat", "-m", "18200", _hash_f, _wl, "--force"],
+                                            timeout=600,
+                                        )
+                                    except FileNotFoundError:
+                                        console.print("  [red]hashcat not found — install it first.[/red]")
+                                        _selected_user = ""
+                                    except _sp2.TimeoutExpired:
+                                        console.print("  [yellow]⚠  hashcat timed out after 10 min.[/yellow]")
+
+                                    if _selected_user:
+                                        # Re-run potfile check to pick up newly cracked pw
+                                        console.print()
+                                        console.print("  [dim]Re-checking potfile…[/dim]")
+                                        _new_map = _resolve_cracked_passwords(state)
+                                        if _selected_user in _new_map:
+                                            _selected_pass = _new_map[_selected_user]
+                                            save_session(state)
+                                            console.print(
+                                                f"  [bold green]✔  Cracked! Password for "
+                                                f"{_selected_user} recovered.[/bold green]"
+                                            )
+                                        else:
+                                            console.print(
+                                                "  [yellow]⚠  Hash not cracked — "
+                                                "try a different wordlist or rule.[/yellow]"
+                                            )
+                                            _selected_user = ""
+
+                            elif _hchoice == "2":
+                                # ── Manual paste ────────────────────────
+                                _cracked = Prompt.ask(
+                                    f"  [bold cyan]Cracked password for {_selected_user}[/bold cyan]",
+                                    default="",
+                                    show_default=False,
+                                    password=False,
+                                ).strip()
+                                if _cracked:
+                                    _selected_pass = _cracked
+                                    # Persist it
+                                    _existing_c = {
+                                        cp["username"]
+                                        for cp in getattr(state, "cracked_passwords", [])
+                                    }
+                                    if _selected_user not in _existing_c:
+                                        state.cracked_passwords.append({
+                                            "username": _selected_user,
+                                            "password": _cracked,
+                                            "source": "manual",
+                                        })
+                                        save_session(state)
+                                    console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                                else:
+                                    console.print("  [yellow]No password entered — aborting.[/yellow]")
+                                    _selected_user = ""
+
                             else:
-                                # User doesn't have the cracked password yet — clear the
-                                # pre-filled username so the manual fallback fires below.
-                                console.print(
-                                    "  [yellow]⚠  No password entered — falling back to manual input.[/yellow]"
-                                )
+                                # 0 — abort / back
                                 _selected_user = ""
             else:
                 console.print("  [dim]No credentials or captured hashes found in session.[/dim]")
