@@ -160,57 +160,53 @@ _POTFILE_CANDIDATES = [
 ]
 
 
-def _read_potfile() -> dict[str, str]:
+def _hashcat_show_usermap(hash_file: str, mode: int) -> dict[str, str]:
     """
-    Read hashcat potfile and return a {truncated_hash: password} mapping.
-    The hash stored in the potfile is the portion before the last ':' in the
-    original multi-component hash line.  We index by the full raw hash too.
-    """
-    mapping: dict[str, str] = {}
-    for _pf in _POTFILE_CANDIDATES:
-        try:
-            if not _pf.exists():
-                continue
-            for _line in _pf.read_text(encoding="utf-8", errors="replace").splitlines():
-                _line = _line.strip()
-                if not _line or _line.startswith("#"):
-                    continue
-                # Format: <hash>:<password>  — password may contain ':'
-                _sep = _line.rfind(":")
-                if _sep == -1:
-                    continue
-                _h, _pw = _line[:_sep], _line[_sep + 1:]
-                mapping[_h] = _pw
-            break  # first readable potfile wins
-        except (OSError, PermissionError):
-            continue  # no access — try next candidate
-    return mapping
+    Run `hashcat --show -m <mode> <file>` and return a {username: password} dict
+    by extracting the username directly from each cracked hash line.
 
+    AS-REP  ($krb5asrep$)  lines embed:  $<etype>$<user>@<DOMAIN>:...:<password>
+    TGS     ($krb5tgs$)    lines embed:  $*<user>/<spn>*$...<password>
 
-def _hashcat_show(hash_file: str, mode: int) -> dict[str, str]:
-    """
-    Run `hashcat --show -m <mode> <file>` and return a {full_hash: password} dict.
-    This is non-destructive — it only reads from the potfile, never re-cracks.
-    Returns an empty dict if hashcat is not available or returns nothing.
+    This approach is immune to hash truncation / formatting differences because
+    we never try to match a raw stored hash against a potfile key — we just read
+    the username out of hashcat's own output.
     """
     result: dict[str, str] = {}
     if not hash_file or not os.path.isfile(hash_file):
         return result
+
+    # Patterns to extract username from hash lines
+    _asrep_user_re = _re_global.compile(
+        r"\$krb5asrep\$\d+\$([^@:$]+)@", _re_global.IGNORECASE
+    )
+    _tgs_user_re = _re_global.compile(
+        r"\$krb5tgs\$\d+\$\*([^/\*]+)/", _re_global.IGNORECASE
+    )
+
     try:
         proc = _subprocess.run(
             ["hashcat", "--show", f"-m{mode}", hash_file],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=30,
         )
         for _line in (proc.stdout or "").splitlines():
             _line = _line.strip()
-            if not _line:
+            if not _line or _line.startswith("#") or _line.startswith("Session"):
                 continue
+            # Password is always the last colon-separated field
             _sep = _line.rfind(":")
             if _sep == -1:
                 continue
-            _h, _pw = _line[:_sep], _line[_sep + 1:]
-            if _pw:
-                result[_h] = _pw
+            _pw = _line[_sep + 1:]
+            if not _pw:
+                continue
+            # Extract username from the hash portion
+            _u = ""
+            _m = _asrep_user_re.search(_line) or _tgs_user_re.search(_line)
+            if _m:
+                _u = _m.group(1).strip()
+            if _u and _pw:
+                result[_u] = _pw
     except (FileNotFoundError, OSError, _subprocess.TimeoutExpired):
         pass
     return result
@@ -220,15 +216,13 @@ def _resolve_cracked_passwords(state) -> dict[str, str]:
     """
     Try to resolve cracked passwords for all hashes in state.hashes.
 
-    Strategy (fastest first):
-      1. Check state.cracked_passwords (already resolved in this session)
-      2. Read hashcat potfile directly
-      3. Run `hashcat --show` on the captured hash files
+    Uses `hashcat --show` on the captured hash files — this is fast (reads
+    potfile, never re-cracks) and reliable because we extract usernames
+    directly from the hash lines instead of trying to key-match raw hashes.
 
-    Returns a {username: password} dict for every account whose hash was
-    already cracked.  Also updates state.cracked_passwords with any new finds.
+    Returns a {username: password} dict.  Also updates state.cracked_passwords.
     """
-    # Build already-known cracked map from session
+    # Start from what's already persisted in the session
     known: dict[str, str] = {
         cp["username"]: cp["password"]
         for cp in getattr(state, "cracked_passwords", [])
@@ -238,34 +232,13 @@ def _resolve_cracked_passwords(state) -> dict[str, str]:
     if not getattr(state, "hashes", []):
         return known
 
-    # Map raw hash → username (strip @DOMAIN)
-    hash_to_user: dict[str, str] = {}
-    for _h in state.hashes:
-        _raw = _h.get("hash", "")
-        _u   = _h.get("username", "").split("@")[0]
-        if _raw and _u:
-            hash_to_user[_raw] = _u
-
-    # 1. Potfile lookup (free, instant)
-    _pot = _read_potfile()
-    for _raw_hash, _u in hash_to_user.items():
-        if _u in known:
-            continue
-        # The potfile stores truncated hashes — try a suffix match too
-        for _pot_key, _pw in _pot.items():
-            if _raw_hash.endswith(_pot_key) or _raw_hash == _pot_key or _pot_key in _raw_hash:
-                known[_u] = _pw
-                break
-
-    # 2. hashcat --show on captured hash files (reads potfile under the hood)
+    # Run hashcat --show on both hash files
     _asrep_file = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
     _kerb_file  = os.path.join("reports", f"{state.assessment_id}-kerb.txt")
 
     for _hf, _mode in ((_asrep_file, 18200), (_kerb_file, 13100)):
-        _shown = _hashcat_show(_hf, _mode)
-        for _raw_hash, _pw in _shown.items():
-            _u = hash_to_user.get(_raw_hash, "")
-            if _u and _u not in known and _pw:
+        for _u, _pw in _hashcat_show_usermap(_hf, _mode).items():
+            if _u not in known:
                 known[_u] = _pw
 
     # Persist newly found cracked passwords back to state
