@@ -167,21 +167,22 @@ def _read_potfile() -> dict[str, str]:
     """
     mapping: dict[str, str] = {}
     for _pf in _POTFILE_CANDIDATES:
-        if _pf.exists():
-            try:
-                for _line in _pf.read_text(encoding="utf-8", errors="replace").splitlines():
-                    _line = _line.strip()
-                    if not _line or _line.startswith("#"):
-                        continue
-                    # Format: <hash>:<password>  — password may contain ':'
-                    _sep = _line.rfind(":")
-                    if _sep == -1:
-                        continue
-                    _h, _pw = _line[:_sep], _line[_sep + 1:]
-                    mapping[_h] = _pw
-            except OSError:
-                pass
-            break  # first potfile wins
+        try:
+            if not _pf.exists():
+                continue
+            for _line in _pf.read_text(encoding="utf-8", errors="replace").splitlines():
+                _line = _line.strip()
+                if not _line or _line.startswith("#"):
+                    continue
+                # Format: <hash>:<password>  — password may contain ':'
+                _sep = _line.rfind(":")
+                if _sep == -1:
+                    continue
+                _h, _pw = _line[:_sep], _line[_sep + 1:]
+                mapping[_h] = _pw
+            break  # first readable potfile wins
+        except (OSError, PermissionError):
+            continue  # no access — try next candidate
     return mapping
 
 
