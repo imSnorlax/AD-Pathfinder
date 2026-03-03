@@ -144,6 +144,140 @@ def _dispatch_action(action_key: str, state: AssessmentState) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hash cracking helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+import re as _re_global
+import subprocess as _subprocess
+import pathlib as _pathlib
+
+_POTFILE_CANDIDATES = [
+    _pathlib.Path.home() / ".local" / "share" / "hashcat" / "hashcat.potfile",
+    _pathlib.Path.home() / ".hashcat" / "hashcat.potfile",
+    _pathlib.Path("/root/.local/share/hashcat/hashcat.potfile"),
+    _pathlib.Path("/root/.hashcat/hashcat.potfile"),
+]
+
+
+def _read_potfile() -> dict[str, str]:
+    """
+    Read hashcat potfile and return a {truncated_hash: password} mapping.
+    The hash stored in the potfile is the portion before the last ':' in the
+    original multi-component hash line.  We index by the full raw hash too.
+    """
+    mapping: dict[str, str] = {}
+    for _pf in _POTFILE_CANDIDATES:
+        if _pf.exists():
+            try:
+                for _line in _pf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#"):
+                        continue
+                    # Format: <hash>:<password>  — password may contain ':'
+                    _sep = _line.rfind(":")
+                    if _sep == -1:
+                        continue
+                    _h, _pw = _line[:_sep], _line[_sep + 1:]
+                    mapping[_h] = _pw
+            except OSError:
+                pass
+            break  # first potfile wins
+    return mapping
+
+
+def _hashcat_show(hash_file: str, mode: int) -> dict[str, str]:
+    """
+    Run `hashcat --show -m <mode> <file>` and return a {full_hash: password} dict.
+    This is non-destructive — it only reads from the potfile, never re-cracks.
+    Returns an empty dict if hashcat is not available or returns nothing.
+    """
+    result: dict[str, str] = {}
+    if not hash_file or not os.path.isfile(hash_file):
+        return result
+    try:
+        proc = _subprocess.run(
+            ["hashcat", "--show", f"-m{mode}", hash_file],
+            capture_output=True, text=True, timeout=15,
+        )
+        for _line in (proc.stdout or "").splitlines():
+            _line = _line.strip()
+            if not _line:
+                continue
+            _sep = _line.rfind(":")
+            if _sep == -1:
+                continue
+            _h, _pw = _line[:_sep], _line[_sep + 1:]
+            if _pw:
+                result[_h] = _pw
+    except (FileNotFoundError, OSError, _subprocess.TimeoutExpired):
+        pass
+    return result
+
+
+def _resolve_cracked_passwords(state) -> dict[str, str]:
+    """
+    Try to resolve cracked passwords for all hashes in state.hashes.
+
+    Strategy (fastest first):
+      1. Check state.cracked_passwords (already resolved in this session)
+      2. Read hashcat potfile directly
+      3. Run `hashcat --show` on the captured hash files
+
+    Returns a {username: password} dict for every account whose hash was
+    already cracked.  Also updates state.cracked_passwords with any new finds.
+    """
+    # Build already-known cracked map from session
+    known: dict[str, str] = {
+        cp["username"]: cp["password"]
+        for cp in getattr(state, "cracked_passwords", [])
+        if cp.get("username") and cp.get("password")
+    }
+
+    if not getattr(state, "hashes", []):
+        return known
+
+    # Map raw hash → username (strip @DOMAIN)
+    hash_to_user: dict[str, str] = {}
+    for _h in state.hashes:
+        _raw = _h.get("hash", "")
+        _u   = _h.get("username", "").split("@")[0]
+        if _raw and _u:
+            hash_to_user[_raw] = _u
+
+    # 1. Potfile lookup (free, instant)
+    _pot = _read_potfile()
+    for _raw_hash, _u in hash_to_user.items():
+        if _u in known:
+            continue
+        # The potfile stores truncated hashes — try a suffix match too
+        for _pot_key, _pw in _pot.items():
+            if _raw_hash.endswith(_pot_key) or _raw_hash == _pot_key or _pot_key in _raw_hash:
+                known[_u] = _pw
+                break
+
+    # 2. hashcat --show on captured hash files (reads potfile under the hood)
+    _asrep_file = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
+    _kerb_file  = os.path.join("reports", f"{state.assessment_id}-kerb.txt")
+
+    for _hf, _mode in ((_asrep_file, 18200), (_kerb_file, 13100)):
+        _shown = _hashcat_show(_hf, _mode)
+        for _raw_hash, _pw in _shown.items():
+            _u = hash_to_user.get(_raw_hash, "")
+            if _u and _u not in known and _pw:
+                known[_u] = _pw
+
+    # Persist newly found cracked passwords back to state
+    _existing_cracked = {cp["username"] for cp in getattr(state, "cracked_passwords", [])}
+    for _u, _pw in known.items():
+        if _u not in _existing_cracked:
+            state.cracked_passwords.append(
+                {"username": _u, "password": _pw, "source": "hashcat"}
+            )
+
+    return known
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Banner / Header helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -979,6 +1113,21 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
 
             _hash_users = _users_from_state_hashes() or _users_from_asrep_file()
 
+            # ── Auto-resolve cracked passwords from hashcat potfile ─────
+            if _hash_users:
+                console.print("  [dim]Checking hashcat potfile for cracked passwords…[/dim]")
+            _cracked_map = _resolve_cracked_passwords(state)
+            if _cracked_map:
+                # Move cracked hash-users into the cred pool (with plaintext)
+                _still_uncracked: list[str] = []
+                for _hu in _hash_users:
+                    if _hu in _cracked_map and not any(c[0] == _hu for c in _cred_pool):
+                        _cred_pool.append((_hu, _cracked_map[_hu], "cracked"))
+                    else:
+                        _still_uncracked.append(_hu)
+                _hash_users = _still_uncracked
+                if _cracked_map:
+                    save_session(state)   # persist newly cracked passwords
 
             # ── Display known creds if any ──────────────────────────────
             console.print()
@@ -1002,20 +1151,40 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                 _all_rows: list[tuple[str, str, str]] = []  # (user, pass, source)
                 for (_u, _p, _src) in _cred_pool:
                     _all_rows.append((_u, _p, _src))
-                    _ct.add_row(str(len(_all_rows)), _u, _p, _src)
+                    _pw_display = (
+                        f"[bold green]{_p}[/bold green]" if _src == "cracked" else _p
+                    )
+                    _src_display = (
+                        "[bold green]cracked ✔[/bold green]" if _src == "cracked"
+                        else f"[bright_blue]{_src}[/bright_blue]"
+                    )
+                    _ct.add_row(str(len(_all_rows)), _u, _pw_display, _src_display)
 
-                # Hash-captured usernames — password not yet known (needs cracking)
+                # Hash-captured usernames — not yet cracked
                 for _hu in _hash_users:
                     _all_rows.append((_hu, "", "hash"))
                     _ct.add_row(
                         str(len(_all_rows)), _hu,
-                        "[dim italic]enter cracked password[/dim italic]",
+                        "[dim italic]not cracked yet[/dim italic]",
                         "[yellow]hash[/yellow]",
                     )
 
                 console.print(_ct)
-                console.print()
-                console.print("  [dim]Pick a number — hash entries will ask for the cracked password.[/dim]")
+                if _hash_users:
+                    console.print()
+                    console.print(
+                        "  [dim]Hash entries marked [yellow]not cracked yet[/yellow] — "
+                        "crack with:[/dim]"
+                    )
+                    _asrep_f = os.path.join("reports", f"{state.assessment_id}-asrep.txt")
+                    if os.path.isfile(_asrep_f):
+                        console.print(
+                            f"  [dim]hashcat -m 18200 {_asrep_f} "
+                            "/usr/share/wordlists/rockyou.txt --force[/dim]"
+                        )
+                    console.print(
+                        "  [dim]Then re-run Kerberoasting — cracked passwords are detected automatically.[/dim]"
+                    )
                 console.print()
 
                 _pick = Prompt.ask(
