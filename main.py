@@ -26,6 +26,53 @@ from session import (
 
 console = Console()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Menu-navigation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _MenuBack(Exception):
+    """Raised to signal a clean 'go back / exit this menu' from any depth."""
+
+
+def _safe_prompt(
+    prompt_str: str,
+    *,
+    choices: list[str] | None = None,
+    default: str = "",
+    show_choices: bool = False,
+    show_default: bool = True,
+    password: bool = False,
+) -> str:
+    """
+    Wrapper around rich.prompt.Prompt.ask that:
+      - Catches KeyboardInterrupt and raises _MenuBack instead
+        (so Ctrl+C always cleanly exits the current menu level).
+      - Accepts 'exit', 'quit', and 'q' as aliases for '0' / back.
+        When choices are provided and '0' is one of them, returning '0'
+        triggers the normal 'back' branch of the caller.  If '0' is not
+        in the choices we raise _MenuBack directly.
+    """
+    EXIT_WORDS = {"exit", "quit", "q"}
+    try:
+        raw = Prompt.ask(
+            prompt_str,
+            choices=choices,
+            default=default,
+            show_choices=show_choices,
+            show_default=show_default,
+            password=password,
+        )
+    except KeyboardInterrupt:
+        console.print()          # newline so the prompt line is not mangled
+        raise _MenuBack()
+    # Map exit words → "0" or raise _MenuBack
+    if raw.strip().lower() in EXIT_WORDS:
+        if choices and "0" in choices:
+            return "0"
+        raise _MenuBack()
+    return raw
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Action dispatcher
 # Maps suggestion action_key → callable that accepts AssessmentState
@@ -992,534 +1039,552 @@ def _display_findings_log(state: AssessmentState) -> None:
 def _phase1_recon_menu(state: AssessmentState) -> None:
     """Phase 1 — Recon sub-menu."""
     while True:
-        console.print()
-        console.rule("[bold bright_cyan]Phase 1 — Recon[/bold bright_cyan]")
-        console.print()
-        console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan        [dim](nmap — run first)[/dim]")
-        console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration           [dim](users/groups/SPNs/policy/ldapdomaindump)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute[dim](shares, guest creds, user/group discovery)[/dim]")
-        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
-        console.print()
-        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3"], show_choices=False)
-        if choice == "0":
+        try:
+            console.print()
+            console.rule("[bold bright_cyan]Phase 1 — Recon[/bold bright_cyan]")
+            console.print()
+            console.print("  [bright_cyan]1.[/bright_cyan]  Port & Service Scan        [dim](nmap — run first)[/dim]")
+            console.print("  [bright_cyan]2.[/bright_cyan]  LDAP Enumeration           [dim](users/groups/SPNs/policy/ldapdomaindump)[/dim]")
+            console.print("  [bright_cyan]3.[/bright_cyan]  SMB Enumeration + RID Brute[dim](shares, guest creds, user/group discovery)[/dim]")
+            console.print("  [bright_cyan]0.[/bright_cyan]  Back  [dim](or type exit / q)[/dim]")
+            console.print()
+            choice = _safe_prompt("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3"], show_choices=False)
+            if choice == "0":
+                break
+            elif choice == "1":
+                from modules.nmap_module import run as nmap_run
+                nmap_run(state)
+                save_session(state)
+            elif choice == "2":
+                from modules.ldap_enum_module import run as ldap_run
+                result = ldap_run(state)
+                _display_ldap_results(result)
+                save_session(state)
+            elif choice == "3":
+                from modules.smb_enum_module import run as smb_run
+                smb_run(state)
+                save_session(state)
+        except (_MenuBack, KeyboardInterrupt):
+            console.print()
             break
-        elif choice == "1":
-            from modules.nmap_module import run as nmap_run
-            nmap_run(state)
-            save_session(state)
-        elif choice == "2":
-            from modules.ldap_enum_module import run as ldap_run
-            result = ldap_run(state)
-            _display_ldap_results(result)
-            save_session(state)
-        elif choice == "3":
-            from modules.smb_enum_module import run as smb_run
-            smb_run(state)
-            save_session(state)
 
 
 def _phase2_exploitation_menu(state: AssessmentState) -> None:
     """Phase 2 — Exploitation sub-menu."""
     while True:
-        console.print()
-        console.rule("[bold bright_cyan]Phase 2 — Exploitation[/bold bright_cyan]")
-        console.print()
-        console.print("  [bright_cyan]1.[/bright_cyan]  AS-REP Roasting      [dim](port 88 — no creds needed)[/dim]")
-        console.print("  [bright_cyan]2.[/bright_cyan]  Kerberoasting        [dim](port 88 + valid creds required)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  Password Spraying    [dim](users required — lockout detection on)[/dim]")
-        console.print("  [bright_cyan]4.[/bright_cyan]  Responder / LLMNR    [dim](same network — captures NetNTLMv2)[/dim]")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Credential Validation[dim](netexec --users + smbpasswd reset)[/dim]")
-        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
-        console.print()
-        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
-        if choice == "0":
-            break
-        elif choice == "1":
-            from modules.asrep_roasting_module import run as asrep_run
-            result = asrep_run(state)
-            _display_asrep_results(result)
-            save_session(state)
+        try:
+            console.print()
+            console.rule("[bold bright_cyan]Phase 2 — Exploitation[/bold bright_cyan]")
+            console.print()
+            console.print("  [bright_cyan]1.[/bright_cyan]  AS-REP Roasting      [dim](port 88 — no creds needed)[/dim]")
+            console.print("  [bright_cyan]2.[/bright_cyan]  Kerberoasting        [dim](port 88 + valid creds required)[/dim]")
+            console.print("  [bright_cyan]3.[/bright_cyan]  Password Spraying    [dim](users required — lockout detection on)[/dim]")
+            console.print("  [bright_cyan]4.[/bright_cyan]  Responder / LLMNR    [dim](same network — captures NetNTLMv2)[/dim]")
+            console.print("  [bright_cyan]5.[/bright_cyan]  Credential Validation[dim](netexec --users + smbpasswd reset)[/dim]")
+            console.print("  [bright_cyan]0.[/bright_cyan]  Back  [dim](or type exit / q)[/dim]")
+            console.print()
+            choice = _safe_prompt("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
 
-            # ── Offer inline hashcat if hashes were captured ───────────
-            if result.get("hashes") and result.get("hash_file"):
-                console.print()
-                _crack_now = Prompt.ask(
-                    "  [bold yellow]Crack hashes now with hashcat?[/bold yellow]",
-                    choices=["yes", "no"], default="no",
-                )
-                if _crack_now == "yes":
-                    _hf  = result["hash_file"]
-                    _wl  = "/usr/share/wordlists/rockyou.txt"
-                    _cmd = ["hashcat", "-m", "18200", _hf, _wl, "--force"]
-                    console.print()
-
-                    if not os.path.isfile(_wl):
-                        console.print(f"  [red]Wordlist not found: {_wl}[/red]")
-                    else:
-                        import subprocess as _sp
-                        import time as _time
-                        from rich.progress import (
-                            Progress, SpinnerColumn,
-                            TextColumn, TimeElapsedColumn,
-                        )
-
-                        _timed_out = False
-                        _proc = None
-                        try:
-                            _proc = _sp.Popen(
-                                _cmd,
-                                stdout=_sp.DEVNULL,
-                                stderr=_sp.DEVNULL,
-                            )
-                            _n = len(result["hashes"])
-                            with Progress(
-                                SpinnerColumn(style="bold cyan"),
-                                TextColumn(
-                                    f"  [bold cyan]Cracking {_n} hash(es) — "
-                                    "rockyou.txt[/bold cyan]"
-                                ),
-                                TimeElapsedColumn(),
-                                console=console,
-                                transient=True,
-                            ) as _prog:
-                                _prog.add_task("", total=None)
-                                _deadline = _time.monotonic() + 900
-                                while _proc.poll() is None:
-                                    if _time.monotonic() > _deadline:
-                                        _proc.terminate()
-                                        _timed_out = True
-                                        break
-                                    _time.sleep(0.5)
-
-                        except FileNotFoundError:
-                            console.print(
-                                "  [red]hashcat not found. "
-                                "Install: sudo apt install hashcat[/red]"
-                            )
-                            _proc = None
-
-                        if _timed_out:
-                            console.print(
-                                "  [yellow]⚠  hashcat timed out after 15 min.[/yellow]"
-                            )
-
-                        if _proc is not None:
-                            # Re-check potfile and persist results
-                            _new = _resolve_cracked_passwords(state)
-                            if _new:
-                                save_session(state)
-                                # ── Results table ───────────────────────
-                                _rt = Table(
-                                    title="[bold green]✔  Cracked Passwords[/bold green]",
-                                    box=box.ROUNDED,
-                                    border_style="green",
-                                    show_lines=True,
-                                    expand=False,
-                                )
-                                _rt.add_column("Username", style="bold yellow", width=28)
-                                _rt.add_column("Password", style="bold white",  width=24)
-                                for _u, _pw in _new.items():
-                                    _rt.add_row(_u, _pw)
-                                console.print()
-                                console.print(_rt)
-                                console.print()
-                                console.print(
-                                    "  [bold bright_cyan]→ Phase 2 → [2] Kerberoasting — "
-                                    "credentials auto-loaded.[/bold bright_cyan]"
-                                )
-                            else:
-                                console.print(
-                                    "  [yellow]⚠  No passwords cracked — "
-                                    "try a different wordlist or rules.[/yellow]"
-                                )
-                    console.print()
-        elif choice == "2":
-            # ── Kerberoasting — credential selection ──────────────────────
-            # Build a numbered table of every known credential in the session.
-            # The user picks a number OR presses Enter to type manually.
-            # We NEVER refuse to run just because no cracked hashes exist.
-            from session import Credentials as _Creds
-
-            # ── 1. Collect all available credentials ──────────────────────
-            # (username, password_or_hash, label)
-            _cred_pool: list[tuple[str, str, str]] = []
-
-            def _add_if_new(u: str, p: str, src: str) -> None:
-                if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
-                    _cred_pool.append((u, p, src))
-
-            # a) Valid credentials confirmed by spraying / cred-validation
-            #    (desc_findings contain raw text, not clean passwords — excluded here)
-
-            for _vc in getattr(state, "valid_credentials", []):
-                _add_if_new(
-                    _vc.get("username", ""),
-                    _vc.get("password", _vc.get("ntlm_hash", "")),
-                    "spray",
-                )
-
-
-            # c) Cracked passwords stored from previous hash-cracking runs
-            for _cp in getattr(state, "cracked_passwords", []):
-                _add_if_new(_cp.get("username", ""), _cp.get("password", ""), "cracked")
-
-            # d) Session initial credentials (supplied at assessment start)
-            _ic = state.initial_credentials
-            if _ic and _ic.username:
-                _add_if_new(_ic.username, _ic.password or _ic.ntlm_hash, "session")
-
-            # ── 2. Auto-check hashcat potfile for any uncracked hashes ────
-            _cracked_map = _resolve_cracked_passwords(state)
-            for _u, _pw in _cracked_map.items():
-                _add_if_new(_u, _pw, "cracked")
-            if _cracked_map:
+            if choice == "0":
+                break
+            elif choice == "1":
+                from modules.asrep_roasting_module import run as asrep_run
+                result = asrep_run(state)
+                _display_asrep_results(result)
                 save_session(state)
 
-            # ── 3. Display credentials table (if any) ─────────────────────
-            console.print()
-            console.rule("[bold bright_cyan]Kerberoasting — Credentials[/bold bright_cyan]")
-            console.print()
-
-            _selected_user = ""
-            _selected_pass = ""
-
-            if _cred_pool:
-                _ct = Table(
-                    title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
-                    box=box.ROUNDED, border_style="bright_blue",
-                    show_lines=True, expand=False,
-                )
-                _ct.add_column("#",        style="bold bright_cyan", width=4)
-                _ct.add_column("Username", style="bold yellow",       width=26)
-                _ct.add_column("Password", style="dim",               width=36)
-                _ct.add_column("Source",   style="bright_blue",       width=12)
-
-                for _idx, (_u, _p, _src) in enumerate(_cred_pool, start=1):
-                    _pw_disp  = f"[bold green]{_p}[/bold green]" if _src == "cracked" else _p
-                    _src_disp = (
-                        "[bold green]cracked ✔[/bold green]" if _src == "cracked"
-                        else f"[bright_blue]{_src}[/bright_blue]"
-                    )
-                    _ct.add_row(str(_idx), _u, _pw_disp, _src_disp)
-
-                console.print(_ct)
-                console.print()
-
-                _pick = Prompt.ask(
-                    "  [bold yellow]Select #[/bold yellow] (Enter to type manually)",
-                    default="",
-                    show_default=False,
-                ).strip()
-
-                if _pick.isdigit():
-                    _i = int(_pick) - 1
-                    if 0 <= _i < len(_cred_pool):
-                        _selected_user, _selected_pass, _ = _cred_pool[_i]
-                        console.print(f"  [green]✔  Using: {_selected_user}[/green]")
-            else:
-                # No plaintext creds yet — show discovered users as a
-                # read-only reference so the operator knows what's available.
-                _known_users: list[str] = sorted(set(
-                    getattr(state, "users", [])
-                    + [u for u in getattr(state, "asrep_users", [])]
-                ))
-                if _known_users:
-                    _preview    = _known_users[:12]
-                    _overflow   = len(_known_users) - len(_preview)
-                    console.print(
-                        f"  [dim]No plaintext credentials in session. "
-                        f"Discovered accounts ({len(_known_users)} total):[/dim]"
-                    )
-                    console.print(
-                        "  " + "    ".join(f"[yellow]{u}[/yellow]" for u in _preview)
-                        + (f"  [dim]… +{_overflow} more[/dim]" if _overflow else "")
-                    )
+                # ── Offer inline hashcat if hashes were captured ───────────
+                if result.get("hashes") and result.get("hash_file"):
                     console.print()
-                else:
-                    console.print(
-                        "  [dim]No credentials or users found in session.[/dim]"
-                    )
-                    console.print()
-
-            # ── 4. Manual entry (always available, required when no pick made) ─
-            if not _selected_user or not _selected_pass:
-                console.print("  [bold bright_cyan]Enter credentials to authenticate:[/bold bright_cyan]")
-                _selected_user = Prompt.ask(
-                    "  [bold cyan]Username[/bold cyan]", default=""
-                ).strip()
-                if _selected_user:
-                    _selected_pass = Prompt.ask(
-                        "  [bold cyan]Password[/bold cyan]", default=""
-                    ).strip()
-
-            if not _selected_user or not _selected_pass:
-                console.print(
-                    "  [red]No credentials provided — Kerberoasting aborted.[/red]"
-                )
-                continue
-
-            # ── 5. Inject into state so the module picks them up ──────────
-            state.initial_credentials = _Creds(
-                username=_selected_user,
-                password=_selected_pass,
-            )
-
-            # ── 6. Run Kerberoasting ──────────────────────────────────────
-            from modules.kerberoasting_module import run as kerb_run
-            result = kerb_run(state)
-
-            # ── 7. Handle "password must change" KDC error ────────────────
-            _warn_blob = " ".join(
-                result.get("warnings", []) + [result.get("error", "") or ""]
-            ).lower()
-            if any(s in _warn_blob for s in (
-                "password must change", "password has expired",
-                "kdc_err_key_expired", "must change", "status_password_must_change",
-            )):
-                console.print()
-                console.print(
-                    "  [bold red]⚠  Password must be changed before this "
-                    "account can be used.[/bold red]"
-                )
-                console.print(
-                    f"  [bright_white]smbpasswd -r {state.target_ip} "
-                    f"-U {_selected_user}[/bright_white]"
-                )
-                console.print()
-                if Prompt.ask(
-                    "  [bold yellow]Change password now?[/bold yellow]",
-                    choices=["yes", "no"], default="no",
-                ) == "yes":
-                    _new_pass  = Prompt.ask("  [bold cyan]New password[/bold cyan]",    password=True)
-                    _new_pass2 = Prompt.ask("  [bold cyan]Confirm new password[/bold cyan]", password=True)
-                    if _new_pass and _new_pass == _new_pass2:
-                        from executor import CommandExecutor as _CE
-                        _env2 = dict(os.environ)
-                        for _v in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
-                            _env2.pop(_v, None)
-                        _ce  = _CE(verbose=False, default_timeout=30)
-                        _pr  = _ce.run(
-                            ["smbpasswd", "-r", state.target_ip, "-U", _selected_user],
-                            env=_env2,
+                    try:
+                        _crack_now = _safe_prompt(
+                            "  [bold yellow]Crack hashes now with hashcat?[/bold yellow]",
+                            choices=["yes", "no"], default="no",
                         )
-                        console.print(
-                            f"  [dim]smbpasswd: {_pr['output'] or _pr['error']}[/dim]"
-                        )
-                        state.initial_credentials = _Creds(
-                            username=_selected_user, password=_new_pass
-                        )
-                        console.print("  [dim]Retrying Kerberoasting…[/dim]")
-                        result = kerb_run(state)
-                    else:
-                        console.print(
-                            "  [red]Passwords do not match — retry manually.[/red]"
-                        )
+                    except _MenuBack:
+                        _crack_now = "no"
+                    if _crack_now == "yes":
+                        _hf  = result["hash_file"]
+                        _wl  = "/usr/share/wordlists/rockyou.txt"
+                        _cmd = ["hashcat", "-m", "18200", _hf, _wl, "--force"]
+                        console.print()
 
-            _display_kerb_results(result)
-            save_session(state)
-
-            # ── Offer inline hashcat for TGS hashes ───────────────────
-            if result.get("hashes") and result.get("hash_file"):
-                console.print()
-                _crack_now = Prompt.ask(
-                    "  [bold yellow]Crack TGS hashes now with hashcat?[/bold yellow]",
-                    choices=["yes", "no"], default="no",
-                )
-                if _crack_now == "yes":
-                    _hf  = result["hash_file"]
-                    _wl  = "/usr/share/wordlists/rockyou.txt"
-                    _cmd = ["hashcat", "-m", "13100", _hf, _wl, "--force"]
-                    console.print()
-                    if not os.path.isfile(_wl):
-                        console.print(f"  [red]Wordlist not found: {_wl}[/red]")
-                    else:
-                        import subprocess as _sp2
-                        import time as _time2
-                        from rich.progress import (
-                            Progress as _Prog2,
-                            SpinnerColumn as _SC2,
-                            TextColumn as _TC2,
-                            TimeElapsedColumn as _TEC2,
-                        )
-                        _timed_out2 = False
-                        _proc2 = None
-                        try:
-                            _proc2 = _sp2.Popen(
-                                _cmd,
-                                stdout=_sp2.DEVNULL,
-                                stderr=_sp2.DEVNULL,
+                        if not os.path.isfile(_wl):
+                            console.print(f"  [red]Wordlist not found: {_wl}[/red]")
+                        else:
+                            import subprocess as _sp
+                            import time as _time
+                            from rich.progress import (
+                                Progress, SpinnerColumn,
+                                TextColumn, TimeElapsedColumn,
                             )
-                            _n2 = len(result["hashes"])
-                            with _Prog2(
-                                _SC2(style="bold cyan"),
-                                _TC2(
-                                    f"  [bold cyan]Cracking {_n2} TGS ticket(s) — "
-                                    "rockyou.txt[/bold cyan]"
-                                ),
-                                _TEC2(),
-                                console=console,
-                                transient=True,
-                            ) as _prog2:
-                                _prog2.add_task("", total=None)
-                                _deadline2 = _time2.monotonic() + 900
-                                while _proc2.poll() is None:
-                                    if _time2.monotonic() > _deadline2:
-                                        _proc2.terminate()
-                                        _timed_out2 = True
-                                        break
-                                    _time2.sleep(0.5)
-                        except FileNotFoundError:
-                            console.print(
-                                "  [red]hashcat not found. "
-                                "Install: sudo apt install hashcat[/red]"
-                            )
-                            _proc2 = None
 
-                        if _timed_out2:
-                            console.print("  [yellow]⚠  hashcat timed out after 15 min.[/yellow]")
-
-                        if _proc2 is not None:
-                            _new2 = _resolve_cracked_passwords(state)
-                            if _new2:
-                                save_session(state)
-                                _rt2 = Table(
-                                    title="[bold green]✔  Cracked TGS Passwords[/bold green]",
-                                    box=box.ROUNDED,
-                                    border_style="green",
-                                    show_lines=True,
-                                    expand=False,
+                            _timed_out = False
+                            _proc = None
+                            try:
+                                _proc = _sp.Popen(
+                                    _cmd,
+                                    stdout=_sp.DEVNULL,
+                                    stderr=_sp.DEVNULL,
                                 )
-                                _rt2.add_column("Username", style="bold yellow", width=28)
-                                _rt2.add_column("Password", style="bold white",  width=24)
-                                for _u2, _pw2 in _new2.items():
-                                    _rt2.add_row(_u2, _pw2)
-                                console.print()
-                                console.print(_rt2)
-                                console.print()
+                                _n = len(result["hashes"])
+                                with Progress(
+                                    SpinnerColumn(style="bold cyan"),
+                                    TextColumn(
+                                        f"  [bold cyan]Cracking {_n} hash(es) — "
+                                        "rockyou.txt[/bold cyan]"
+                                    ),
+                                    TimeElapsedColumn(),
+                                    console=console,
+                                    transient=True,
+                                ) as _prog:
+                                    _prog.add_task("", total=None)
+                                    _deadline = _time.monotonic() + 900
+                                    while _proc.poll() is None:
+                                        if _time.monotonic() > _deadline:
+                                            _proc.terminate()
+                                            _timed_out = True
+                                            break
+                                        _time.sleep(0.5)
+
+                            except FileNotFoundError:
                                 console.print(
-                                    "  [bold bright_cyan]→ Credentials saved to session — "
-                                    "use in Phase 3 for lateral movement.[/bold bright_cyan]"
+                                    "  [red]hashcat not found. "
+                                    "Install: sudo apt install hashcat[/red]"
                                 )
-                            else:
-                                console.print(
-                                    "  [yellow]⚠  No TGS hashes cracked — "
-                                    "try a different wordlist or add rules.[/yellow]"
-                                )
-                    console.print()
+                                _proc = None
 
-        elif choice == "3":
-            passwords = Prompt.ask(
-                "  [bold yellow]Password(s) to spray[/bold yellow] [dim](comma-separated)[/dim]"
-            ).split(",")
-            passwords = [p.strip() for p in passwords if p.strip()]
-            if passwords:
-                from modules.password_spray_module import run as spray_run
-                preview = spray_run(state, passwords=passwords, confirmed=False)
-                _display_spray_results(preview)
-                if Prompt.ask("  [bold red]Execute spray?[/bold red]", choices=["yes", "no"], default="no") == "yes":
-                    result = spray_run(state, passwords=passwords, confirmed=True)
-                    _display_spray_results(result)
+                            if _timed_out:
+                                console.print(
+                                    "  [yellow]⚠  hashcat timed out after 15 min.[/yellow]"
+                                )
+
+                            if _proc is not None:
+                                # Re-check potfile and persist results
+                                _new = _resolve_cracked_passwords(state)
+                                if _new:
+                                    save_session(state)
+                                    # ── Results table ───────────────────────
+                                    _rt = Table(
+                                        title="[bold green]✔  Cracked Passwords[/bold green]",
+                                        box=box.ROUNDED,
+                                        border_style="green",
+                                        show_lines=True,
+                                        expand=False,
+                                    )
+                                    _rt.add_column("Username", style="bold yellow", width=28)
+                                    _rt.add_column("Password", style="bold white",  width=24)
+                                    for _u, _pw in _new.items():
+                                        _rt.add_row(_u, _pw)
+                                    console.print()
+                                    console.print(_rt)
+                                    console.print()
+                                    console.print(
+                                        "  [bold bright_cyan]→ Phase 2 → [2] Kerberoasting — "
+                                        "credentials auto-loaded.[/bold bright_cyan]"
+                                    )
+                                else:
+                                    console.print(
+                                        "  [yellow]⚠  No passwords cracked — "
+                                        "try a different wordlist or rules.[/yellow]"
+                                    )
+                        console.print()
+            elif choice == "2":
+                # ── Kerberoasting — credential selection ──────────────────────
+                from session import Credentials as _Creds
+
+                _cred_pool: list[tuple[str, str, str]] = []
+
+                def _add_if_new(u: str, p: str, src: str) -> None:
+                    if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
+                        _cred_pool.append((u, p, src))
+
+                for _vc in getattr(state, "valid_credentials", []):
+                    _add_if_new(
+                        _vc.get("username", ""),
+                        _vc.get("password", _vc.get("ntlm_hash", "")),
+                        "spray",
+                    )
+
+                for _cp in getattr(state, "cracked_passwords", []):
+                    _add_if_new(_cp.get("username", ""), _cp.get("password", ""), "cracked")
+
+                _ic = state.initial_credentials
+                if _ic and _ic.username:
+                    _add_if_new(_ic.username, _ic.password or _ic.ntlm_hash, "session")
+
+                _cracked_map = _resolve_cracked_passwords(state)
+                for _u, _pw in _cracked_map.items():
+                    _add_if_new(_u, _pw, "cracked")
+                if _cracked_map:
                     save_session(state)
-        elif choice == "4":
-            from modules.responder_module import run as responder_run
-            result = responder_run(state)
-            _display_responder_results(result)
-            save_session(state)
-        elif choice == "5":
-            from modules.cred_validation_module import run as cred_run
-            result = cred_run(state)
-            _display_cred_validation_results(result)
-            save_session(state)
+
+                console.print()
+                console.rule("[bold bright_cyan]Kerberoasting — Credentials[/bold bright_cyan]")
+                console.print()
+
+                _selected_user = ""
+                _selected_pass = ""
+
+                if _cred_pool:
+                    _ct = Table(
+                        title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
+                        box=box.ROUNDED, border_style="bright_blue",
+                        show_lines=True, expand=False,
+                    )
+                    _ct.add_column("#",        style="bold bright_cyan", width=4)
+                    _ct.add_column("Username", style="bold yellow",       width=26)
+                    _ct.add_column("Password", style="dim",               width=36)
+                    _ct.add_column("Source",   style="bright_blue",       width=12)
+
+                    for _idx, (_u, _p, _src) in enumerate(_cred_pool, start=1):
+                        _pw_disp  = f"[bold green]{_p}[/bold green]" if _src == "cracked" else _p
+                        _src_disp = (
+                            "[bold green]cracked ✔[/bold green]" if _src == "cracked"
+                            else f"[bright_blue]{_src}[/bright_blue]"
+                        )
+                        _ct.add_row(str(_idx), _u, _pw_disp, _src_disp)
+
+                    console.print(_ct)
+                    console.print()
+
+                    try:
+                        _pick = _safe_prompt(
+                            "  [bold yellow]Select #[/bold yellow] (Enter to type manually)",
+                            default="",
+                            show_default=False,
+                        ).strip()
+                    except _MenuBack:
+                        _pick = ""
+
+                    if _pick.isdigit():
+                        _i = int(_pick) - 1
+                        if 0 <= _i < len(_cred_pool):
+                            _selected_user, _selected_pass, _ = _cred_pool[_i]
+                            console.print(f"  [green]✔  Using: {_selected_user}[/green]")
+                else:
+                    _known_users: list[str] = sorted(set(
+                        getattr(state, "users", [])
+                        + [u for u in getattr(state, "asrep_users", [])]
+                    ))
+                    if _known_users:
+                        _preview    = _known_users[:12]
+                        _overflow   = len(_known_users) - len(_preview)
+                        console.print(
+                            f"  [dim]No plaintext credentials in session. "
+                            f"Discovered accounts ({len(_known_users)} total):[/dim]"
+                        )
+                        console.print(
+                            "  " + "    ".join(f"[yellow]{u}[/yellow]" for u in _preview)
+                            + (f"  [dim]… +{_overflow} more[/dim]" if _overflow else "")
+                        )
+                        console.print()
+                    else:
+                        console.print("  [dim]No credentials or users found in session.[/dim]")
+                        console.print()
+
+                if not _selected_user or not _selected_pass:
+                    console.print("  [bold bright_cyan]Enter credentials to authenticate:[/bold bright_cyan]")
+                    try:
+                        _selected_user = _safe_prompt(
+                            "  [bold cyan]Username[/bold cyan]", default=""
+                        ).strip()
+                    except _MenuBack:
+                        _selected_user = ""
+                    if _selected_user:
+                        try:
+                            _selected_pass = _safe_prompt(
+                                "  [bold cyan]Password[/bold cyan]", default=""
+                            ).strip()
+                        except _MenuBack:
+                            _selected_pass = ""
+
+                if not _selected_user or not _selected_pass:
+                    console.print("  [red]No credentials provided — Kerberoasting aborted.[/red]")
+                    continue
+
+                state.initial_credentials = _Creds(
+                    username=_selected_user,
+                    password=_selected_pass,
+                )
+
+                from modules.kerberoasting_module import run as kerb_run
+                result = kerb_run(state)
+
+                _warn_blob = " ".join(
+                    result.get("warnings", []) + [result.get("error", "") or ""]
+                ).lower()
+                if any(s in _warn_blob for s in (
+                    "password must change", "password has expired",
+                    "kdc_err_key_expired", "must change", "status_password_must_change",
+                )):
+                    console.print()
+                    console.print(
+                        "  [bold red]⚠  Password must be changed before this "
+                        "account can be used.[/bold red]"
+                    )
+                    console.print(
+                        f"  [bright_white]smbpasswd -r {state.target_ip} "
+                        f"-U {_selected_user}[/bright_white]"
+                    )
+                    console.print()
+                    try:
+                        _ch = _safe_prompt(
+                            "  [bold yellow]Change password now?[/bold yellow]",
+                            choices=["yes", "no"], default="no",
+                        )
+                    except _MenuBack:
+                        _ch = "no"
+                    if _ch == "yes":
+                        try:
+                            _new_pass  = _safe_prompt("  [bold cyan]New password[/bold cyan]",    password=True)
+                            _new_pass2 = _safe_prompt("  [bold cyan]Confirm new password[/bold cyan]", password=True)
+                        except _MenuBack:
+                            _new_pass = _new_pass2 = ""
+                        if _new_pass and _new_pass == _new_pass2:
+                            from executor import CommandExecutor as _CE
+                            _env2 = dict(os.environ)
+                            for _v in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+                                _env2.pop(_v, None)
+                            _ce  = _CE(verbose=False, default_timeout=30)
+                            _pr  = _ce.run(
+                                ["smbpasswd", "-r", state.target_ip, "-U", _selected_user],
+                                env=_env2,
+                            )
+                            console.print(f"  [dim]smbpasswd: {_pr['output'] or _pr['error']}[/dim]")
+                            state.initial_credentials = _Creds(
+                                username=_selected_user, password=_new_pass
+                            )
+                            console.print("  [dim]Retrying Kerberoasting…[/dim]")
+                            result = kerb_run(state)
+                        else:
+                            console.print("  [red]Passwords do not match — retry manually.[/red]")
+
+                _display_kerb_results(result)
+                save_session(state)
+
+                if result.get("hashes") and result.get("hash_file"):
+                    console.print()
+                    try:
+                        _crack_now2 = _safe_prompt(
+                            "  [bold yellow]Crack TGS hashes now with hashcat?[/bold yellow]",
+                            choices=["yes", "no"], default="no",
+                        )
+                    except _MenuBack:
+                        _crack_now2 = "no"
+                    if _crack_now2 == "yes":
+                        _hf2  = result["hash_file"]
+                        _wl2  = "/usr/share/wordlists/rockyou.txt"
+                        _cmd2 = ["hashcat", "-m", "13100", _hf2, _wl2, "--force"]
+                        console.print()
+                        if not os.path.isfile(_wl2):
+                            console.print(f"  [red]Wordlist not found: {_wl2}[/red]")
+                        else:
+                            import subprocess as _sp2
+                            import time as _time2
+                            from rich.progress import (
+                                Progress as _Prog2,
+                                SpinnerColumn as _SC2,
+                                TextColumn as _TC2,
+                                TimeElapsedColumn as _TEC2,
+                            )
+                            _timed_out2 = False
+                            _proc2 = None
+                            try:
+                                _proc2 = _sp2.Popen(
+                                    _cmd2,
+                                    stdout=_sp2.DEVNULL,
+                                    stderr=_sp2.DEVNULL,
+                                )
+                                _n2 = len(result["hashes"])
+                                with _Prog2(
+                                    _SC2(style="bold cyan"),
+                                    _TC2(
+                                        f"  [bold cyan]Cracking {_n2} TGS ticket(s) — "
+                                        "rockyou.txt[/bold cyan]"
+                                    ),
+                                    _TEC2(),
+                                    console=console,
+                                    transient=True,
+                                ) as _prog2:
+                                    _prog2.add_task("", total=None)
+                                    _deadline2 = _time2.monotonic() + 900
+                                    while _proc2.poll() is None:
+                                        if _time2.monotonic() > _deadline2:
+                                            _proc2.terminate()
+                                            _timed_out2 = True
+                                            break
+                                        _time2.sleep(0.5)
+                            except FileNotFoundError:
+                                console.print(
+                                    "  [red]hashcat not found. "
+                                    "Install: sudo apt install hashcat[/red]"
+                                )
+                                _proc2 = None
+
+                            if _timed_out2:
+                                console.print("  [yellow]⚠  hashcat timed out after 15 min.[/yellow]")
+
+                            if _proc2 is not None:
+                                _new2 = _resolve_cracked_passwords(state)
+                                if _new2:
+                                    save_session(state)
+                                    _rt2 = Table(
+                                        title="[bold green]✔  Cracked TGS Passwords[/bold green]",
+                                        box=box.ROUNDED,
+                                        border_style="green",
+                                        show_lines=True,
+                                        expand=False,
+                                    )
+                                    _rt2.add_column("Username", style="bold yellow", width=28)
+                                    _rt2.add_column("Password", style="bold white",  width=24)
+                                    for _u2, _pw2 in _new2.items():
+                                        _rt2.add_row(_u2, _pw2)
+                                    console.print()
+                                    console.print(_rt2)
+                                    console.print()
+                                    console.print(
+                                        "  [bold bright_cyan]→ Credentials saved to session — "
+                                        "use in Phase 3 for lateral movement.[/bold bright_cyan]"
+                                    )
+                                else:
+                                    console.print(
+                                        "  [yellow]⚠  No TGS hashes cracked — "
+                                        "try a different wordlist or add rules.[/yellow]"
+                                    )
+                        console.print()
+
+            elif choice == "3":
+                try:
+                    passwords_raw = _safe_prompt(
+                        "  [bold yellow]Password(s) to spray[/bold yellow] [dim](comma-separated)[/dim]"
+                    )
+                except _MenuBack:
+                    passwords_raw = ""
+                passwords = [p.strip() for p in passwords_raw.split(",") if p.strip()]
+                if passwords:
+                    from modules.password_spray_module import run as spray_run
+                    preview = spray_run(state, passwords=passwords, confirmed=False)
+                    _display_spray_results(preview)
+                    try:
+                        _conf = _safe_prompt(
+                            "  [bold red]Execute spray?[/bold red]",
+                            choices=["yes", "no"], default="no",
+                        )
+                    except _MenuBack:
+                        _conf = "no"
+                    if _conf == "yes":
+                        result = spray_run(state, passwords=passwords, confirmed=True)
+                        _display_spray_results(result)
+                        save_session(state)
+            elif choice == "4":
+                from modules.responder_module import run as responder_run
+                result = responder_run(state)
+                _display_responder_results(result)
+                save_session(state)
+            elif choice == "5":
+                from modules.cred_validation_module import run as cred_run
+                result = cred_run(state)
+                _display_cred_validation_results(result)
+                save_session(state)
+
+        except (_MenuBack, KeyboardInterrupt):
+            console.print()
+            break
 
 
 def _phase3_postex_menu(state: AssessmentState) -> None:
     """Phase 3 — Post-Exploitation sub-menu."""
     while True:
-        console.print()
-        console.rule("[bold bright_cyan]Phase 3 — Post-Exploitation[/bold bright_cyan]")
-        console.print()
-        console.print("  [bright_cyan]1.[/bright_cyan]  ACL Abuse / WriteDACL[dim](net rpc group addmembers)[/dim]")
-        console.print("  [bright_cyan]2.[/bright_cyan]  Evil-WinRM Shell     [dim](password auth, port 5985/5986)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  DCSync               [dim](impacket-secretsdump — all domain hashes)[/dim]")
-        console.print("  [bright_cyan]4.[/bright_cyan]  Pass-the-Hash (PTH)  [dim](evil-winrm -H <nt_hash>)[/dim]")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Golden Ticket        [dim](impacket-ticketer — needs krbtgt NT hash)[/dim]")
-        console.print("  [bright_cyan]0.[/bright_cyan]  Back")
-        console.print()
-        choice = Prompt.ask("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
-        if choice == "0":
+        try:
+            console.print()
+            console.rule("[bold bright_cyan]Phase 3 — Post-Exploitation[/bold bright_cyan]")
+            console.print()
+            console.print("  [bright_cyan]1.[/bright_cyan]  ACL Abuse / WriteDACL[dim](net rpc group addmembers)[/dim]")
+            console.print("  [bright_cyan]2.[/bright_cyan]  Evil-WinRM Shell     [dim](password auth, port 5985/5986)[/dim]")
+            console.print("  [bright_cyan]3.[/bright_cyan]  DCSync               [dim](impacket-secretsdump — all domain hashes)[/dim]")
+            console.print("  [bright_cyan]4.[/bright_cyan]  Pass-the-Hash (PTH)  [dim](evil-winrm -H <nt_hash>)[/dim]")
+            console.print("  [bright_cyan]5.[/bright_cyan]  Golden Ticket        [dim](impacket-ticketer — needs krbtgt NT hash)[/dim]")
+            console.print("  [bright_cyan]0.[/bright_cyan]  Back  [dim](or type exit / q)[/dim]")
+            console.print()
+            choice = _safe_prompt("  [bold yellow]Select[/bold yellow]", choices=["0", "1", "2", "3", "4", "5"], show_choices=False)
+            if choice == "0":
+                break
+            elif choice == "1":
+                from modules.acl_abuse_module import run as acl_run
+                result = acl_run(state)
+                _display_acl_results(result)
+                save_session(state)
+            elif choice in ("2", "4"):
+                from modules.evil_winrm_module import run as winrm_run
+                winrm_run(state)
+                save_session(state)
+            elif choice == "3":
+                from modules.dcsync_module import run as dcsync_run
+                result = dcsync_run(state)
+                _display_dcsync_results(result)
+                save_session(state)
+            elif choice == "5":
+                from modules.golden_ticket_module import run as gt_run
+                result = gt_run(state)
+                _display_golden_ticket_results(result)
+                save_session(state)
+        except (_MenuBack, KeyboardInterrupt):
+            console.print()
             break
-        elif choice == "1":
-            from modules.acl_abuse_module import run as acl_run
-            result = acl_run(state)
-            _display_acl_results(result)
-            save_session(state)
-        elif choice in ("2", "4"):
-            from modules.evil_winrm_module import run as winrm_run
-            winrm_run(state)
-            save_session(state)
-        elif choice == "3":
-            from modules.dcsync_module import run as dcsync_run
-            result = dcsync_run(state)
-            _display_dcsync_results(result)
-            save_session(state)
-        elif choice == "5":
-            from modules.golden_ticket_module import run as gt_run
-            result = gt_run(state)
-            _display_golden_ticket_results(result)
-            save_session(state)
 
 
 def assessment_menu(state: AssessmentState) -> None:
     """Main interaction loop for an active assessment session."""
 
     while True:
-        console.print()
-        print_assessment_header(state)
-        console.print()
+        try:
+            console.print()
+            print_assessment_header(state)
+            console.print()
 
-        console.rule("[bold bright_cyan]Assessment Menu[/bold bright_cyan]")
-        console.print()
+            console.rule("[bold bright_cyan]Assessment Menu[/bold bright_cyan]")
+            console.print()
 
-        # ── Smart guide ──────────────────────────────────────────────────
-        console.print("  [bold bright_cyan]★[/bold bright_cyan]  [bold bright_cyan]A.[/bold bright_cyan]  [bold white]Auto-Suggest Next Step[/bold white]  [dim](recommended)[/dim]")
-        console.print()
+            console.print("  [bold bright_cyan]★[/bold bright_cyan]  [bold bright_cyan]A.[/bold bright_cyan]  [bold white]Auto-Suggest Next Step[/bold white]  [dim](recommended)[/dim]")
+            console.print()
 
-        # ── PHASES ──────────────────────────────────────────────────
-        console.print("  [dim]── PHASES ────────────────────────────────────────────────────[/dim]")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Phase 1 — Recon              [dim](nmap, ldap, smb)[/dim]")
-        console.print("  [bright_cyan]2.[/bright_cyan]  Phase 2 — Exploitation       [dim](AS-REP, Kerb, Spray, Responder, Cred Validation)[/dim]")
-        console.print("  [bright_cyan]3.[/bright_cyan]  Phase 3 — Post-Exploitation  [dim](ACL Abuse, Evil-WinRM, DCSync, PTH, Golden Ticket)[/dim]")
-        console.print()
+            console.print("  [dim]── PHASES ────────────────────────────────────────────────────[/dim]")
+            console.print("  [bright_cyan]1.[/bright_cyan]  Phase 1 — Recon              [dim](nmap, ldap, smb)[/dim]")
+            console.print("  [bright_cyan]2.[/bright_cyan]  Phase 2 — Exploitation       [dim](AS-REP, Kerb, Spray, Responder, Cred Validation)[/dim]")
+            console.print("  [bright_cyan]3.[/bright_cyan]  Phase 3 — Post-Exploitation  [dim](ACL Abuse, Evil-WinRM, DCSync, PTH, Golden Ticket)[/dim]")
+            console.print()
 
-        # ── SESSION ────────────────────────────────────────────────
-        console.print("  [dim]── SESSION ────────────────────────────────────────────────[/dim]")
-        console.print("  [bright_cyan]4.[/bright_cyan]  View Findings Log")
-        console.print("  [bright_cyan]5.[/bright_cyan]  Save & Return to Main Menu")
-        console.print()
+            console.print("  [dim]── SESSION ────────────────────────────────────────────────[/dim]")
+            console.print("  [bright_cyan]4.[/bright_cyan]  View Findings Log")
+            console.print("  [bright_cyan]5.[/bright_cyan]  Save & Return to Main Menu  [dim](or type exit / q)[/dim]")
+            console.print()
 
-        choice = Prompt.ask(
-            "  [bold yellow]Select option[/bold yellow]",
-            choices=["a", "A", "1", "2", "3", "4", "5"],
-            show_choices=False,
-        )
+            choice = _safe_prompt(
+                "  [bold yellow]Select option[/bold yellow]",
+                choices=["a", "A", "1", "2", "3", "4", "5"],
+                show_choices=False,
+            )
 
-        if choice.lower() == "a":
-            execute_suggested_action(state)
-        elif choice == "1":
-            _phase1_recon_menu(state)
-        elif choice == "2":
-            _phase2_exploitation_menu(state)
-        elif choice == "3":
-            _phase3_postex_menu(state)
-        elif choice == "4":
-            _display_findings_log(state)
-        elif choice == "5":
+            if choice.lower() == "a":
+                execute_suggested_action(state)
+            elif choice == "1":
+                _phase1_recon_menu(state)
+            elif choice == "2":
+                _phase2_exploitation_menu(state)
+            elif choice == "3":
+                _phase3_postex_menu(state)
+            elif choice == "4":
+                _display_findings_log(state)
+            elif choice == "5":
+                path = save_session(state)
+                console.print(f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n")
+                break
+        except (_MenuBack, KeyboardInterrupt):
+            # Ctrl+C or "exit"/"q" at the assessment menu → save & return to main menu
             path = save_session(state)
-            console.print(f"\n  [bold green]✔  Session saved:[/bold green] [dim]{path}[/dim]\n")
+            console.print(f"\n  [bold green]✔  Session auto-saved:[/bold green] [dim]{path}[/dim]\n")
             break
-
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1530,32 +1595,37 @@ def main_menu() -> None:
     print_banner()
 
     while True:
-        console.print("[bold bright_cyan]Main Menu[/bold bright_cyan]\n")
-        console.print("  [bright_cyan]1.[/bright_cyan]  Start New Assessment")
-        console.print("  [bright_cyan]2.[/bright_cyan]  Load Existing Assessment")
-        console.print("  [bright_cyan]3.[/bright_cyan]  Exit")
-        console.print()
+        try:
+            console.print("[bold bright_cyan]Main Menu[/bold bright_cyan]\n")
+            console.print("  [bright_cyan]1.[/bright_cyan]  Start New Assessment")
+            console.print("  [bright_cyan]2.[/bright_cyan]  Load Existing Assessment")
+            console.print("  [bright_cyan]3.[/bright_cyan]  Exit  [dim](or type exit / q)[/dim]")
+            console.print()
 
-        choice = Prompt.ask(
-            "  [bold yellow]Select option[/bold yellow]",
-            choices=["1", "2", "3"],
-            show_choices=False,
-        )
+            choice = _safe_prompt(
+                "  [bold yellow]Select option[/bold yellow]",
+                choices=["1", "2", "3"],
+                show_choices=False,
+            )
 
-        if choice == "1":
-            state = start_new_assessment()
-            assessment_menu(state)
-
-        elif choice == "2":
-            state = load_existing_assessment()
-            if state:
+            if choice == "1":
+                state = start_new_assessment()
                 assessment_menu(state)
 
-        elif choice == "3":
-            console.print("\n  [dim]Goodbye.[/dim]\n")
-            sys.exit(0)
+            elif choice == "2":
+                state = load_existing_assessment()
+                if state:
+                    assessment_menu(state)
 
-        console.print()
+            elif choice == "3":
+                console.print("\n  [dim]Goodbye.[/dim]\n")
+                sys.exit(0)
+
+            console.print()
+
+        except (_MenuBack, KeyboardInterrupt):
+            console.print("\n\n  [dim]Goodbye.[/dim]\n")
+            sys.exit(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
