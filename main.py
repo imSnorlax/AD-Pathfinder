@@ -507,12 +507,29 @@ def _display_asrep_results(result: dict) -> None:
     console.print(); console.print(table)
 
     if hashes:
-        console.print(f"\n  [bold yellow]Crack command:[/bold yellow]")
-        console.print(f"  [dim]{result['crack_command']}[/dim]\n")
-        for h in hashes[:5]:
+        console.print()
+        console.print("  [bold green]✔  Step 1 complete — AS-REP hashes captured.[/bold green]")
+        console.print()
+        # ── Next steps panel ────────────────────────────────────────────
+        steps = Table(box=box.ROUNDED, border_style="yellow", show_header=False, expand=False)
+        steps.add_column("Step", style="bold yellow",      width=8)
+        steps.add_column("What", style="bold bright_cyan", width=14)
+        steps.add_column("How",  style="white")
+        steps.add_row(
+            "Step 2", "Crack offline",
+            f"[bold white]{result['crack_command']}[/bold white]",
+        )
+        steps.add_row(
+            "Step 3", "Kerberoast",
+            "Phase 2 → [2] Kerberoasting  "
+            "[dim](cracked password auto-detected)[/dim]",
+        )
+        console.print(steps)
+        console.print()
+        for h in hashes[:3]:
             console.print(f"  [dim]{h[:100]}[/dim]")
-        if len(hashes) > 5:
-            console.print(f"  [dim]... and {len(hashes)-5} more in file[/dim]")
+        if len(hashes) > 3:
+            console.print(f"  [dim]  … +{len(hashes)-3} more in file[/dim]")
 
     for w in result.get("warnings", []):
         console.print(f"\n  [yellow]⚠  {w}[/yellow]")
@@ -1022,6 +1039,57 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             result = asrep_run(state)
             _display_asrep_results(result)
             save_session(state)
+
+            # ── Offer inline hashcat if hashes were captured ───────────
+            if result.get("hashes") and result.get("hash_file"):
+                console.print()
+                _crack_now = Prompt.ask(
+                    "  [bold yellow]Crack hashes now with hashcat?[/bold yellow] "
+                    "[dim](runs inline — leave blank to skip)[/dim]",
+                    choices=["yes", "no"], default="no",
+                )
+                if _crack_now == "yes":
+                    _hf  = result["hash_file"]
+                    _wl  = "/usr/share/wordlists/rockyou.txt"
+                    _cmd = ["hashcat", "-m", "18200", _hf, _wl, "--force"]
+                    console.print()
+                    if not os.path.isfile(_wl):
+                        console.print(f"  [red]Wordlist not found: {_wl}[/red]")
+                    else:
+                        console.print("  [bold cyan]Running hashcat — this may take several minutes…[/bold cyan]")
+                        console.print(f"  [dim]{' '.join(_cmd)}[/dim]")
+                        console.print()
+                        import subprocess as _sp
+                        try:
+                            _sp.run(_cmd, timeout=900)
+                        except FileNotFoundError:
+                            console.print("  [red]hashcat not found. Install it: sudo apt install hashcat[/red]")
+                        except _sp.TimeoutExpired:
+                            console.print("  [yellow]⚠  hashcat timed out after 15 min.[/yellow]")
+
+                        # Re-check potfile and persist any cracked passwords
+                        console.print()
+                        console.print("  [dim]Checking potfile for cracked passwords…[/dim]")
+                        _new = _resolve_cracked_passwords(state)
+                        if _new:
+                            save_session(state)
+                            console.print()
+                            for _u, _pw in _new.items():
+                                console.print(
+                                    f"  [bold green]✔  Cracked:[/bold green] "
+                                    f"[yellow]{_u}[/yellow] → [bold white]{_pw}[/bold white]"
+                                )
+                            console.print()
+                            console.print(
+                                "  [bold bright_cyan]→ Go to Phase 2 → [2] Kerberoasting "
+                                "to use these credentials.[/bold bright_cyan]"
+                            )
+                        else:
+                            console.print(
+                                "  [yellow]⚠  No passwords cracked — "
+                                "try a different wordlist or rules.[/yellow]"
+                            )
+                    console.print()
         elif choice == "2":
             # ── Kerberoasting — credential selection ──────────────────────
             # Build a numbered table of every known credential in the session.
@@ -1113,20 +1181,16 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                     + [u for u in getattr(state, "asrep_users", [])]
                 ))
                 if _known_users:
+                    _preview    = _known_users[:12]
+                    _overflow   = len(_known_users) - len(_preview)
                     console.print(
-                        "  [dim]No plaintext credentials in session. "
-                        "Discovered domain accounts:[/dim]"
+                        f"  [dim]No plaintext credentials in session. "
+                        f"Discovered accounts ({len(_known_users)} total):[/dim]"
                     )
-                    console.print()
-                    # Print in columns of 4
-                    _cols = 4
-                    for _row_start in range(0, len(_known_users), _cols):
-                        _chunk = _known_users[_row_start:_row_start + _cols]
-                        console.print(
-                            "  " + "    ".join(
-                                f"[yellow]{_un}[/yellow]" for _un in _chunk
-                            )
-                        )
+                    console.print(
+                        "  " + "    ".join(f"[yellow]{u}[/yellow]" for u in _preview)
+                        + (f"  [dim]… +{_overflow} more[/dim]" if _overflow else "")
+                    )
                     console.print()
                 else:
                     console.print(
