@@ -124,8 +124,62 @@ class CredentialValidationModule:
             return {"status": "error", "operation": "cancelled", "valid_creds": [],
                     "reset_done": False, "error": "Cancelled by operator.", "warnings": []}
 
-        username = Prompt.ask("  [bold yellow]Username[/bold yellow]").strip()
-        password = Prompt.ask("  [bold yellow]Password[/bold yellow]").strip()
+        # ── Credential picker ──────────────────────────────────────────
+        # Build pool from any known creds in the session
+        _cred_pool: list[tuple[str, str, str]] = []  # (user, pass, source)
+
+        def _add(u: str, p: str, src: str) -> None:
+            if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
+                _cred_pool.append((u, p, src))
+
+        for cp in getattr(state, "cracked_passwords", []):
+            _add(cp.get("username", ""), cp.get("password", ""), "cracked")
+        for vc in getattr(state, "valid_credentials", []):
+            _add(vc.get("username", ""), vc.get("password", vc.get("ntlm_hash", "")), "spray")
+        ic = state.initial_credentials
+        if ic and ic.username:
+            _add(ic.username, ic.password or ic.ntlm_hash, "session")
+
+        username = ""
+        password = ""
+
+        if _cred_pool:
+            _ct = Table(
+                title="[bold bright_cyan]Available Credentials[/bold bright_cyan]",
+                box=box.ROUNDED, border_style="bright_blue",
+                show_lines=True, expand=False,
+            )
+            _ct.add_column("#",        style="bold bright_cyan", width=4)
+            _ct.add_column("Username", style="bold yellow",       width=26)
+            _ct.add_column("Password", style="dim",               width=28)
+            _ct.add_column("Source",   style="bright_blue",       width=10)
+            for _i, (_u, _p, _s) in enumerate(_cred_pool, 1):
+                _pw_d  = f"[bold green]{_p}[/bold green]" if _s == "cracked" else _p
+                _src_d = "[bold green]cracked ✔[/bold green]" if _s == "cracked" else f"[bright_blue]{_s}[/bright_blue]"
+                _ct.add_row(str(_i), _u, _pw_d, _src_d)
+            console.print()
+            console.print(_ct)
+            console.print()
+            _pick = Prompt.ask(
+                "  [bold yellow]Select #[/bold yellow] (Enter to type manually)",
+                default="", show_default=False,
+            ).strip()
+            if _pick.isdigit():
+                _idx = int(_pick) - 1
+                if 0 <= _idx < len(_cred_pool):
+                    username, password, _ = _cred_pool[_idx]
+                    console.print(f"  [green]✔  Using: {username}[/green]")
+        else:
+            console.print("  [dim]No credentials in session — enter manually.[/dim]")
+
+        if not username:
+            username = Prompt.ask("  [bold yellow]Username[/bold yellow]", default="").strip()
+        if not password and username:
+            password = Prompt.ask("  [bold yellow]Password[/bold yellow]", default="").strip()
+
+        if not username or not password:
+            return {"status": "error", "operation": "cancelled", "valid_creds": [],
+                    "reset_done": False, "error": "No credentials provided.", "warnings": []}
 
         result: dict = {
             "status":      "success",

@@ -85,6 +85,18 @@ def _parse_spray_output(output: str) -> tuple[list[dict], bool]:
         if m:
             username = m.group(1).strip()
             password = m.group(2).strip()
+
+            # Skip Guest-level hits — nxc marks these with (Guest) at the end.
+            # They mean the password was wrong but the DC allowed guest access.
+            if "(Guest)" in password or "(Guest)" in line.split(
+                f"{username}:"
+            )[-1]:
+                continue
+
+            # Skip AD group names — they contain spaces and are not real accounts
+            if " " in username:
+                continue
+
             valid_creds.append({"username": username, "password": password})
 
     return valid_creds, lockout_detected
