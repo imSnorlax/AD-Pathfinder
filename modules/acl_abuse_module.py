@@ -79,43 +79,104 @@ class ACLAbuseModule:
                 "'net' binary not found. Install: sudo apt install samba-common-bin"
             )
 
-        # ── Prompt for parameters ─────────────────────────────────────────
+        # ── Header ───────────────────────────────────────────────
         console.print()
-        console.print("  [bold bright_cyan]ACL Abuse — WriteDACL Group Membership[/bold bright_cyan]\n")
+        console.rule("[bold bright_cyan]ACL Abuse — WriteDACL Group Membership[/bold bright_cyan]")
+        console.print()
 
-        target_group = Prompt.ask(
-            "  [bold yellow]Target group to add member to[/bold yellow] [dim](e.g. EXECUTIVES)[/dim]"
-        ).strip()
+        # ── Authenticating credential picker ──────────────────────
+        _cred_pool: list[tuple[str, str, str]] = []
 
-        member_user = Prompt.ask(
-            "  [bold yellow]User to add to that group[/bold yellow] [dim](e.g. mssql_svc)[/dim]"
-        ).strip()
+        def _add(u: str, p: str, src: str) -> None:
+            if u and p and not any(c[0] == u and c[1] == p for c in _cred_pool):
+                _cred_pool.append((u, p, src))
 
-        # Prefer valid_credentials, fall back to initial
+        for cp in getattr(state, "cracked_passwords", []):
+            _add(cp.get("username", ""), cp.get("password", ""), "cracked")
+        for vc in getattr(state, "valid_credentials", []):
+            _add(vc.get("username", ""), vc.get("password", vc.get("ntlm_hash", "")), "spray")
+        ic = state.initial_credentials
+        if ic and ic.username:
+            _add(ic.username, ic.password or ic.ntlm_hash, "session")
+
         auth_user = ""
         auth_pass = ""
-        if state.valid_credentials:
-            cred = state.valid_credentials[0]
-            auth_user = cred.get("username", "")
-            auth_pass = cred.get("password", "")
-        elif state.initial_credentials.username:
-            auth_user = state.initial_credentials.username
-            auth_pass = state.initial_credentials.password
+
+        if _cred_pool:
+            _ct = Table(
+                title="[bold bright_cyan]Authenticating Credentials[/bold bright_cyan]",
+                box=box.ROUNDED, border_style="bright_blue",
+                show_lines=True, expand=False,
+            )
+            _ct.add_column("#",        style="bold bright_cyan", width=4)
+            _ct.add_column("Username", style="bold yellow",       width=26)
+            _ct.add_column("Password", style="dim",               width=24)
+            _ct.add_column("Source",   style="bright_blue",       width=10)
+            for _i, (_u, _p, _s) in enumerate(_cred_pool, 1):
+                _pw_d  = f"[bold green]{_p}[/bold green]" if _s == "cracked" else _p
+                _src_d = "[bold green]cracked ✔[/bold green]" if _s == "cracked" else f"[bright_blue]{_s}[/bright_blue]"
+                _ct.add_row(str(_i), _u, _pw_d, _src_d)
+            console.print(_ct)
+            console.print()
+            _pick = Prompt.ask(
+                "  [bold yellow]Select # to authenticate as[/bold yellow] (Enter to type manually)",
+                default="", show_default=False,
+            ).strip()
+            if _pick.isdigit():
+                _idx = int(_pick) - 1
+                if 0 <= _idx < len(_cred_pool):
+                    auth_user, auth_pass, _ = _cred_pool[_idx]
+                    console.print(f"  [green]✔  Using: {auth_user}[/green]")
+        else:
+            console.print("  [dim]No credentials in session — enter manually.[/dim]")
+            console.print()
 
         if not auth_user:
-            auth_user = Prompt.ask("  [bold yellow]Authenticating username[/bold yellow]").strip()
-            auth_pass = Prompt.ask("  [bold yellow]Password[/bold yellow]").strip()
-        else:
+            auth_user = Prompt.ask("  [bold yellow]Username[/bold yellow]", default="").strip()
+        if not auth_pass and auth_user:
+            auth_pass = Prompt.ask("  [bold yellow]Password[/bold yellow]", default="").strip()
+
+        if not auth_user or not auth_pass:
+            return self._error("No authenticating credentials provided.")
+
+        # ── Target group ───────────────────────────────────────────
+        console.print()
+        _known_groups = getattr(state, "groups", [])
+        if _known_groups:
             console.print(
-                f"  [dim]Using stored credentials: {auth_user}[/dim]"
+                "  [dim]Discovered groups: [/dim]"
+                + "    ".join(f"[yellow]{g}[/yellow]" for g in _known_groups[:8])
+                + (f"  [dim]… +{len(_known_groups)-8} more[/dim]" if len(_known_groups) > 8 else "")
             )
-            override = Prompt.ask(
-                "  [bold yellow]Use different credentials?[/bold yellow]",
-                choices=["yes", "no"], default="no",
+            console.print()
+
+        target_group = Prompt.ask(
+            "  [bold yellow]Target group[/bold yellow] [dim](e.g. Domain Admins)[/dim]",
+            default="Domain Admins",
+        ).strip()
+
+        # ── Member to add ─────────────────────────────────────────
+        console.print()
+        _all_users = sorted(set(
+            [c[0] for c in _cred_pool]
+            + getattr(state, "users", [])[:12]
+        ))
+        if _all_users:
+            _preview = _all_users[:12]
+            _overflow = len(_all_users) - len(_preview)
+            console.print(
+                "  [dim]Known accounts: [/dim]"
+                + "    ".join(f"[yellow]{u}[/yellow]" for u in _preview)
+                + (f"  [dim]… +{_overflow} more[/dim]" if _overflow else "")
             )
-            if override == "yes":
-                auth_user = Prompt.ask("  [bold yellow]Username[/bold yellow]").strip()
-                auth_pass = Prompt.ask("  [bold yellow]Password[/bold yellow]").strip()
+            console.print()
+
+        member_user = Prompt.ask(
+            "  [bold yellow]User to add to that group[/bold yellow]"
+        ).strip()
+
+        if not target_group or not member_user:
+            return self._error("Target group and member are required.")
 
         domain = state.domain
 
