@@ -280,6 +280,20 @@ class EvilWinRMModule:
             return self._error("evil-winrm not found on PATH.")
         except KeyboardInterrupt:
             exit_code = 0
+        finally:
+            # evil-winrm (Ruby/Reline) modifies terminal settings and doesn't
+            # fully restore them on exit.  Reset to a sane state before we
+            # print anything or redraw a Rich menu.
+            try:
+                import subprocess as _sp
+                _sp.run(["stty", "sane"], check=False,
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            except Exception:
+                pass
+            try:
+                console.show_cursor(True)
+            except Exception:
+                pass
 
         console.print()
         if exit_code == 0:
