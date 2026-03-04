@@ -35,6 +35,27 @@ class _MenuBack(Exception):
     """Raised to signal a clean 'go back / exit this menu' from any depth."""
 
 
+def _restore_terminal() -> None:
+    """
+    Reset the terminal to a sane state.
+
+    When Ctrl+C fires during Python's input() / readline, the terminal can
+    be left in raw / no-echo mode.  Running 'stty sane' restores echo and
+    line-buffering so the shell is usable again.
+    """
+    try:
+        import subprocess as _sub
+        _sub.run(["stty", "sane"], check=False,
+                 stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+    except Exception:
+        pass
+    # Also ask Rich's Console to reset any live-display state it may hold
+    try:
+        console.show_cursor(True)
+    except Exception:
+        pass
+
+
 def _safe_prompt(
     prompt_str: str,
     *,
@@ -46,7 +67,7 @@ def _safe_prompt(
 ) -> str:
     """
     Wrapper around rich.prompt.Prompt.ask that:
-      - Catches KeyboardInterrupt and raises _MenuBack instead
+      - Catches KeyboardInterrupt, restores the terminal, and raises _MenuBack
         (so Ctrl+C always cleanly exits the current menu level).
       - Accepts 'exit', 'quit', and 'q' as aliases for '0' / back.
         When choices are provided and '0' is one of them, returning '0'
@@ -64,7 +85,8 @@ def _safe_prompt(
             password=password,
         )
     except KeyboardInterrupt:
-        console.print()          # newline so the prompt line is not mangled
+        _restore_terminal()       # ← fix broken terminal state first
+        console.print()           # newline so the prompt line is not mangled
         raise _MenuBack()
     # Map exit words → "0" or raise _MenuBack
     if raw.strip().lower() in EXIT_WORDS:
