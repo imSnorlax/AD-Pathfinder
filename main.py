@@ -1044,8 +1044,7 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
             if result.get("hashes") and result.get("hash_file"):
                 console.print()
                 _crack_now = Prompt.ask(
-                    "  [bold yellow]Crack hashes now with hashcat?[/bold yellow] "
-                    "[dim](runs inline — leave blank to skip)[/dim]",
+                    "  [bold yellow]Crack hashes now with hashcat?[/bold yellow]",
                     choices=["yes", "no"], default="no",
                 )
                 if _crack_now == "yes":
@@ -1053,42 +1052,86 @@ def _phase2_exploitation_menu(state: AssessmentState) -> None:
                     _wl  = "/usr/share/wordlists/rockyou.txt"
                     _cmd = ["hashcat", "-m", "18200", _hf, _wl, "--force"]
                     console.print()
+
                     if not os.path.isfile(_wl):
                         console.print(f"  [red]Wordlist not found: {_wl}[/red]")
                     else:
-                        console.print("  [bold cyan]Running hashcat — this may take several minutes…[/bold cyan]")
-                        console.print(f"  [dim]{' '.join(_cmd)}[/dim]")
-                        console.print()
                         import subprocess as _sp
-                        try:
-                            _sp.run(_cmd, timeout=900)
-                        except FileNotFoundError:
-                            console.print("  [red]hashcat not found. Install it: sudo apt install hashcat[/red]")
-                        except _sp.TimeoutExpired:
-                            console.print("  [yellow]⚠  hashcat timed out after 15 min.[/yellow]")
+                        import time as _time
+                        from rich.progress import (
+                            Progress, SpinnerColumn,
+                            TextColumn, TimeElapsedColumn,
+                        )
 
-                        # Re-check potfile and persist any cracked passwords
-                        console.print()
-                        console.print("  [dim]Checking potfile for cracked passwords…[/dim]")
-                        _new = _resolve_cracked_passwords(state)
-                        if _new:
-                            save_session(state)
-                            console.print()
-                            for _u, _pw in _new.items():
-                                console.print(
-                                    f"  [bold green]✔  Cracked:[/bold green] "
-                                    f"[yellow]{_u}[/yellow] → [bold white]{_pw}[/bold white]"
+                        _timed_out = False
+                        _proc = None
+                        try:
+                            _proc = _sp.Popen(
+                                _cmd,
+                                stdout=_sp.DEVNULL,
+                                stderr=_sp.DEVNULL,
+                            )
+                            _n = len(result["hashes"])
+                            with Progress(
+                                SpinnerColumn(style="bold cyan"),
+                                TextColumn(
+                                    f"  [bold cyan]Cracking {_n} hash(es) — "
+                                    "rockyou.txt[/bold cyan]"
+                                ),
+                                TimeElapsedColumn(),
+                                console=console,
+                                transient=True,
+                            ) as _prog:
+                                _prog.add_task("", total=None)
+                                _deadline = _time.monotonic() + 900
+                                while _proc.poll() is None:
+                                    if _time.monotonic() > _deadline:
+                                        _proc.terminate()
+                                        _timed_out = True
+                                        break
+                                    _time.sleep(0.5)
+
+                        except FileNotFoundError:
+                            console.print(
+                                "  [red]hashcat not found. "
+                                "Install: sudo apt install hashcat[/red]"
+                            )
+                            _proc = None
+
+                        if _timed_out:
+                            console.print(
+                                "  [yellow]⚠  hashcat timed out after 15 min.[/yellow]"
+                            )
+
+                        if _proc is not None:
+                            # Re-check potfile and persist results
+                            _new = _resolve_cracked_passwords(state)
+                            if _new:
+                                save_session(state)
+                                # ── Results table ───────────────────────
+                                _rt = Table(
+                                    title="[bold green]✔  Cracked Passwords[/bold green]",
+                                    box=box.ROUNDED,
+                                    border_style="green",
+                                    show_lines=True,
+                                    expand=False,
                                 )
-                            console.print()
-                            console.print(
-                                "  [bold bright_cyan]→ Go to Phase 2 → [2] Kerberoasting "
-                                "to use these credentials.[/bold bright_cyan]"
-                            )
-                        else:
-                            console.print(
-                                "  [yellow]⚠  No passwords cracked — "
-                                "try a different wordlist or rules.[/yellow]"
-                            )
+                                _rt.add_column("Username", style="bold yellow", width=28)
+                                _rt.add_column("Password", style="bold white",  width=24)
+                                for _u, _pw in _new.items():
+                                    _rt.add_row(_u, _pw)
+                                console.print()
+                                console.print(_rt)
+                                console.print()
+                                console.print(
+                                    "  [bold bright_cyan]→ Phase 2 → [2] Kerberoasting — "
+                                    "credentials auto-loaded.[/bold bright_cyan]"
+                                )
+                            else:
+                                console.print(
+                                    "  [yellow]⚠  No passwords cracked — "
+                                    "try a different wordlist or rules.[/yellow]"
+                                )
                     console.print()
         elif choice == "2":
             # ── Kerberoasting — credential selection ──────────────────────
